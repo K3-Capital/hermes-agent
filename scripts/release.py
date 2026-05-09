@@ -53,10 +53,12 @@ AUTHOR_MAP = {
     "harish.kukreja@gmail.com": "counterposition",
     "cleo@edaphic.xyz": "curiouscleo",
     "hirokazu.ogawa@kwansei.ac.jp": "hrkzogw",
+    "datapod.k@gmail.com": "dandacompany",
     "127238744+teknium1@users.noreply.github.com": "teknium1",
     "128259593+Gutslabs@users.noreply.github.com": "Gutslabs",
     "50326054+nocturnum91@users.noreply.github.com": "nocturnum91",
     "223003280+Abd0r@users.noreply.github.com": "Abd0r",
+    "ra2157218@gmail.com": "Abd0r",
     "abdielv@proton.me": "AJV20",
     "mason@growagainorchids.com": "masonjames",
     "ytchen0719@gmail.com": "liquidchen",
@@ -907,6 +909,7 @@ AUTHOR_MAP = {
     "promptsiren@gmail.com": "firefly",  # PR #18123 salvage of #16660 (ContextVars)
     "wtyopenclaw@gmail.com": "WuTianyi123",  # PR #20275 salvage of #13723 (feishu markdown)
     "zhicheng.han@mathematik.uni-goettingen.de": "hanzckernel",  # PR #20311 (api-server approval events)
+    "agentsmithlaor@gmail.com": "oferlaor",  # PR #22356 salvage (cron origin sender identity)
     # pander: empty email, salvaged via PR #19665 from #16126 by @ms-alan
 }
 
@@ -1365,7 +1368,7 @@ def main():
     )
 
     if args.output:
-        Path(args.output).write_text(changelog)
+        Path(args.output).write_text(changelog, encoding="utf-8")
         print(f"Changelog written to {args.output}")
     else:
         print(changelog)
