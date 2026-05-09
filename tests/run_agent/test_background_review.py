@@ -190,3 +190,81 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     assert captured_bg_callback[0].startswith("💾 Self-improvement review:"), (
         captured_bg_callback[0]
     )
+
+
+def test_acp_background_review_runs_synchronously(monkeypatch):
+    events: list[str] = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            events.append("run_conversation")
+
+        def shutdown_memory_provider(self):
+            events.append("shutdown_memory_provider")
+
+        def close(self):
+            events.append("close")
+
+    class UnexpectedThread:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("ACP review should run inline, not in a daemon thread")
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", UnexpectedThread)
+    monkeypatch.delenv("HERMES_BACKGROUND_REVIEW_SYNC", raising=False)
+
+    agent = _bare_agent()
+    agent.platform = "acp"
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_skills=True,
+    )
+
+    assert events == ["run_conversation", "shutdown_memory_provider", "close"]
+
+
+def test_background_review_sync_env_can_disable_acp_inline_mode(monkeypatch):
+    started = []
+
+    class NoopReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    class CapturingThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            self._target = target
+            self.daemon = daemon
+            self.name = name
+
+        def start(self):
+            started.append((self.daemon, self.name))
+            self._target()
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", NoopReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
+    monkeypatch.setenv("HERMES_BACKGROUND_REVIEW_SYNC", "false")
+
+    agent = _bare_agent()
+    agent.platform = "acp"
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_skills=True,
+    )
+
+    assert started == [(True, "bg-review")]

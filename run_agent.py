@@ -3787,8 +3787,30 @@ class AIAgent:
                 except Exception:
                     pass
 
+        if self._should_run_background_review_synchronously():
+            _run_review()
+            return
+
         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
         t.start()
+
+    def _should_run_background_review_synchronously(self) -> bool:
+        """Return true when the review must finish before this turn returns.
+
+        The normal CLI/gateway path intentionally runs self-improvement in a
+        daemon thread after delivering the user's response. One-shot transports
+        such as ACP are different: clients like Multica close stdin/cancel the
+        Hermes process as soon as ``session/prompt`` returns, which can kill the
+        daemon thread before it writes memory or skills. Run inline for ACP so
+        the prompt response is not reported complete until the self-improvement
+        cycle has had its chance to finish.
+        """
+        env_value = os.environ.get("HERMES_BACKGROUND_REVIEW_SYNC", "")
+        if env_value:
+            return env_value.strip().lower() in {"1", "true", "yes", "on"}
+
+        platform = (self.platform or os.environ.get("HERMES_SESSION_SOURCE", "")).lower()
+        return platform == "acp"
 
     def _build_memory_write_metadata(
         self,
