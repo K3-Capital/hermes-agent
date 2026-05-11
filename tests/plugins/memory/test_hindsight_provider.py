@@ -18,8 +18,10 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    _check_api_supports_update_mode_append,
     _load_config,
     _build_embedded_profile_env,
+    _meets_minimum_version,
     _normalize_retain_tags,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
@@ -1078,6 +1080,53 @@ class TestSessionSwitchBufferFlush:
 
 
 class TestUpdateModeAppendCapability:
+    def test_semver_comparison_does_not_require_packaging_dependency(self, monkeypatch):
+        """Hindsight 0.6.0 must be considered newer than 0.5.0 even when
+        the optional packaging dependency is unavailable in the runtime image.
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _import_without_packaging(name, *args, **kwargs):
+            if name == "packaging.version":
+                raise ModuleNotFoundError("No module named 'packaging'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _import_without_packaging)
+
+        assert _meets_minimum_version("0.6.0", "0.5.0") is True
+        assert _meets_minimum_version("0.4.22", "0.5.0") is False
+
+    def test_api_version_0_6_0_enables_append_without_packaging(
+        self, monkeypatch, caplog
+    ):
+        """A modern API must not emit the legacy fallback warning just because
+        the runtime image lacks packaging.
+        """
+        import builtins
+        import logging
+
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.6.0",
+        )
+
+        real_import = builtins.__import__
+
+        def _import_without_packaging(name, *args, **kwargs):
+            if name == "packaging.version":
+                raise ModuleNotFoundError("No module named 'packaging'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _import_without_packaging)
+
+        with caplog.at_level(logging.WARNING, logger="plugins.memory.hindsight"):
+            assert _check_api_supports_update_mode_append("http://hindsight:8888") is True
+
+        assert "older than 0.5.0" not in caplog.text
+
     def _clear_capability_cache(self):
         from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
         with _append_capability_lock:

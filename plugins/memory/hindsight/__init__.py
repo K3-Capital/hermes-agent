@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 
 from datetime import datetime, timezone
@@ -110,6 +111,24 @@ _append_capability_cache: Dict[str, bool] = {}
 _append_capability_lock = threading.Lock()
 
 
+def _version_release_tuple(version: str | None) -> tuple[int, ...] | None:
+    """Return the numeric release tuple from a semver-ish version string.
+
+    This intentionally handles the simple Hindsight API versions we gate on
+    (for example ``0.5.0`` and ``0.6.0``) without requiring the optional
+    ``packaging`` dependency to be present in minimal runtime images.
+    """
+    if not version:
+        return None
+    match = re.match(r"^\s*v?(\d+(?:\.\d+)*)", str(version))
+    if not match:
+        return None
+    try:
+        return tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:
+        return None
+
+
 def _meets_minimum_version(actual: str | None, required: str) -> bool:
     """Return True if *actual* ≥ *required* (semver). False on missing/invalid."""
     if not actual:
@@ -118,7 +137,14 @@ def _meets_minimum_version(actual: str | None, required: str) -> bool:
         from packaging.version import Version
         return Version(actual) >= Version(required)
     except Exception:
-        return False
+        actual_release = _version_release_tuple(actual)
+        required_release = _version_release_tuple(required)
+        if actual_release is None or required_release is None:
+            return False
+        width = max(len(actual_release), len(required_release))
+        actual_padded = actual_release + (0,) * (width - len(actual_release))
+        required_padded = required_release + (0,) * (width - len(required_release))
+        return actual_padded >= required_padded
 
 
 def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
