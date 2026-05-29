@@ -3510,6 +3510,9 @@ def refresh_codex_oauth_pure(
     next_refresh = refresh_payload.get("refresh_token")
     if isinstance(next_refresh, str) and next_refresh.strip():
         updated["refresh_token"] = next_refresh.strip()
+    next_id_token = refresh_payload.get("id_token")
+    if isinstance(next_id_token, str) and next_id_token.strip():
+        updated["id_token"] = next_id_token.strip()
     return updated
 
 

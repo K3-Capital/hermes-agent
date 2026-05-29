@@ -467,6 +467,24 @@ def _patch_httpx(monkeypatch, response):
     monkeypatch.setattr("hermes_cli.auth.httpx.Client", _factory)
 
 
+
+def test_refresh_codex_oauth_pure_preserves_id_token(monkeypatch):
+    response = _StubHTTPResponse(
+        200,
+        {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "id_token": "id-new",
+        },
+    )
+    _patch_httpx(monkeypatch, response)
+
+    refreshed = refresh_codex_oauth_pure("access-old", "refresh-old")
+
+    assert refreshed["access_token"] == "access-new"
+    assert refreshed["refresh_token"] == "refresh-new"
+    assert refreshed["id_token"] == "id-new"
+
 def test_refresh_parses_openai_nested_error_shape_refresh_token_reused(monkeypatch):
     """OpenAI returns {"error": {"code": "refresh_token_reused", "message": "..."}}
     — parser must surface relogin_required and the dedicated message.
