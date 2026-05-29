@@ -510,6 +510,108 @@ def _patch_httpx(monkeypatch, response):
     monkeypatch.setattr("hermes_cli.auth.httpx.Client", _factory)
 
 
+def test_refresh_codex_oauth_pure_preserves_id_token(monkeypatch):
+    response = _StubHTTPResponse(
+        200,
+        {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "id_token": "id-new",
+        },
+    )
+    _patch_httpx(monkeypatch, response)
+
+    refreshed = refresh_codex_oauth_pure("access-old", "refresh-old")
+
+    assert refreshed["access_token"] == "access-new"
+    assert refreshed["refresh_token"] == "refresh-new"
+    assert refreshed["id_token"] == "id-new"
+
+def test_refresh_parses_openai_nested_error_shape_refresh_token_reused(monkeypatch):
+    """OpenAI returns {"error": {"code": "refresh_token_reused", "message": "..."}}
+    — parser must surface relogin_required and the dedicated message.
+    """
+    response = _StubHTTPResponse(
+        401,
+        {
+            "error": {
+                "message": "Your refresh token has already been used to generate a new access token. Please try signing in again.",
+                "type": "invalid_request_error",
+                "param": None,
+                "code": "refresh_token_reused",
+            }
+        },
+    )
+    _patch_httpx(monkeypatch, response)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("a-tok", "r-tok")
+
+    err = exc_info.value
+    assert err.code == "refresh_token_reused"
+    assert err.relogin_required is True
+    # The existing dedicated branch should override the message with actionable guidance.
+    assert "already consumed by another client" in str(err)
+
+
+def test_refresh_parses_openai_nested_error_shape_generic_code(monkeypatch):
+    """Nested error with arbitrary code still surfaces code + message."""
+    response = _StubHTTPResponse(
+        400,
+        {
+            "error": {
+                "message": "Invalid client credentials.",
+                "type": "invalid_request_error",
+                "code": "invalid_client",
+            }
+        },
+    )
+    _patch_httpx(monkeypatch, response)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("a-tok", "r-tok")
+
+    err = exc_info.value
+    assert err.code == "invalid_client"
+    assert "Invalid client credentials." in str(err)
+
+
+def test_refresh_parses_oauth_spec_flat_error_shape_invalid_grant(monkeypatch):
+    """Fallback path: OAuth spec-shape {"error": "invalid_grant", "error_description": "..."}
+    must still map to relogin_required=True via the existing code set.
+    """
+    response = _StubHTTPResponse(
+        400,
+        {
+            "error": "invalid_grant",
+            "error_description": "Refresh token is expired or revoked.",
+        },
+    )
+    _patch_httpx(monkeypatch, response)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("a-tok", "r-tok")
+
+    err = exc_info.value
+    assert err.code == "invalid_grant"
+    assert err.relogin_required is True
+    assert "Refresh token is expired or revoked." in str(err)
+
+
+def test_refresh_falls_back_to_generic_message_on_unparseable_body(monkeypatch):
+    """No JSON body → generic 'with status 401' message; 401 always forces relogin."""
+    response = _StubHTTPResponse(401, ValueError("not json"))
+    _patch_httpx(monkeypatch, response)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("a-tok", "r-tok")
+
+    err = exc_info.value
+    assert err.code == "codex_refresh_failed"
+    # 401/403 from the token endpoint always means the refresh token is
+    # invalid/expired — force relogin even without a parseable error body.
+    assert err.relogin_required is True
+    assert "status 401" in str(err)
 
 
 def test_refresh_429_classified_as_quota_not_auth_failure(monkeypatch):
