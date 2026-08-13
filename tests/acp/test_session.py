@@ -109,6 +109,31 @@ class TestCreateSession:
         state = SessionManager(db=None).create_session(cwd="/tmp/project")
 
         assert state.agent.session_cwd == "/tmp/project"
+        assert state.agent.kwargs["max_iterations"] == 90
+
+    def test_make_agent_uses_configured_agent_max_turns(self, monkeypatch):
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        config = {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "agent": {"max_turns": 180},
+            "mcp_servers": {},
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {},
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *_args: None)
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert state.agent.kwargs["max_iterations"] == 180
 
 
 

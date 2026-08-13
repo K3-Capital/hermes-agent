@@ -1994,6 +1994,7 @@ class HermesACPAgent(acp.Agent):
         final_response = result.get("final_response", "")
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
+        iteration_limit_exhausted = bool(result.get("iteration_limit_exhausted"))
         # Hermes' local "waiting for model response" interrupt status is metadata,
         # not assistant prose — clients get cancellation from stop_reason instead.
         from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
@@ -2042,6 +2043,7 @@ class HermesACPAgent(acp.Agent):
             final_response
             and conn
             and not suppress_interrupt_response
+            and not iteration_limit_exhausted
             and (not streamed_message or result.get("response_transformed"))
         ):
             # Deliver the final response when streaming did not already send it,
@@ -2050,6 +2052,17 @@ class HermesACPAgent(acp.Agent):
             # rewritten text never reaches the client.
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
+
+        if iteration_limit_exhausted:
+            logger.warning(
+                "ACP session %s exhausted iteration budget (%s); returning refusal",
+                session_id,
+                result.get("turn_exit_reason", "unknown"),
+            )
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
+            return PromptResponse(stop_reason="refusal")
 
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as

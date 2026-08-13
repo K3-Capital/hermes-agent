@@ -614,6 +614,24 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
+        agent_cfg = config.get("agent")
+        configured_max_turns = (
+            agent_cfg.get("max_turns")
+            if isinstance(agent_cfg, dict)
+            else None
+        )
+        if not isinstance(configured_max_turns, (int, str)) or isinstance(
+            configured_max_turns, bool
+        ):
+            max_iterations = 90
+        else:
+            try:
+                max_iterations = int(configured_max_turns)
+            except (ValueError, OverflowError):
+                max_iterations = 90
+        if max_iterations < 1:
+            max_iterations = 90
+
         configured_mcp_servers = [
             name
             for name, cfg in (config.get("mcp_servers") or {}).items()
@@ -630,6 +648,11 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            # ACP creates AIAgent directly, bypassing the CLI/gateway config
+            # bridge. Pass the resolved profile budget explicitly so ACP runs
+            # honor agent.max_turns instead of silently taking AIAgent's 90
+            # iteration constructor default.
+            "max_iterations": max_iterations,
         }
 
         try:
