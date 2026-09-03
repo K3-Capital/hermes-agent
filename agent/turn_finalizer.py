@@ -202,6 +202,9 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
+        # The tool-less summary describes incomplete work. Callers must not
+        # mistake it for a successful completion.
+        failed = True
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback
@@ -714,6 +717,7 @@ def finalize_turn(
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
+        "iteration_limit_exhausted": iteration_limit_fallback,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,

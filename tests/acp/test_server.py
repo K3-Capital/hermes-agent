@@ -447,6 +447,30 @@ class TestPrompt:
         assert captured.get("child") == resp.session_id
 
 
+    @pytest.mark.asyncio
+    async def test_prompt_refuses_iteration_limit_summary(self, agent, mock_manager):
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.agent.run_conversation = lambda *_args, **_kwargs: {
+            "final_response": "I reached the iteration limit.",
+            "messages": [],
+            "iteration_limit_exhausted": True,
+            "turn_exit_reason": "max_iterations_reached(500/500)",
+        }
+        mock_conn = MagicMock()
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        result = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="continue work")],
+            session_id=resp.session_id,
+        )
+
+        assert result.stop_reason == "refusal"
+        assert state.is_running is False
+        mock_conn.session_update.assert_not_awaited()
+
+
 
 
 

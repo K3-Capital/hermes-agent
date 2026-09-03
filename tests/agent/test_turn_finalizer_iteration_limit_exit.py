@@ -114,6 +114,22 @@ def _finalize(
     )
 
 
+def test_iteration_limit_summary_is_failed_not_completed(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="budget_exhausted",
+    )
+
+    assert agent._handle_max_iterations_called is True
+    assert result["iteration_limit_exhausted"] is True
+    assert result["failed"] is True
+    assert result["completed"] is False
+
+
 
 
 

@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import sys
 import time
 from types import SimpleNamespace
 import pytest
@@ -64,6 +65,63 @@ class TestCreateSession:
         state = manager.create_session()
         fetched = manager.get_session(state.session_id)
         assert fetched is state
+
+
+    @staticmethod
+    def _patch_make_agent_env(monkeypatch, config):
+        """Route _make_agent through a kwargs-capturing FakeAgent with config."""
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "chat_completions",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *_args: None)
+
+    def test_make_agent_honors_configured_max_turns(self, monkeypatch):
+        self._patch_make_agent_env(monkeypatch, {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "agent": {"max_turns": 500},
+            "mcp_servers": {},
+        })
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert state.agent.kwargs["max_iterations"] == 500
+
+    @pytest.mark.parametrize("max_turns", ["none", "unlimited", -1])
+    def test_make_agent_resolves_unlimited_turn_limit_spellings(self, monkeypatch, max_turns):
+        self._patch_make_agent_env(monkeypatch, {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "agent": {"max_turns": max_turns},
+            "mcp_servers": {},
+        })
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert state.agent.kwargs["max_iterations"] == sys.maxsize
+
+    def test_make_agent_leaves_unset_turn_limit_to_agent_default(self, monkeypatch):
+        self._patch_make_agent_env(monkeypatch, {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "mcp_servers": {},
+        })
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert "max_iterations" not in state.agent.kwargs
 
 
     def test_make_agent_stamps_session_cwd_for_codex_runtime(self, monkeypatch):
