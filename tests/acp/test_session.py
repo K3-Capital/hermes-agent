@@ -167,6 +167,7 @@ class TestCreateSession:
         state = SessionManager(db=None).create_session(cwd="/tmp/project")
 
         assert state.agent.session_cwd == "/tmp/project"
+        assert "max_iterations" not in state.agent.kwargs
 
 
 

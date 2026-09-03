@@ -446,7 +446,6 @@ class TestPrompt:
 
         assert captured.get("child") == resp.session_id
 
-
     @pytest.mark.asyncio
     async def test_prompt_refuses_iteration_limit_summary(self, agent, mock_manager):
         resp = await agent.new_session(cwd=".")

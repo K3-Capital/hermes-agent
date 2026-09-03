@@ -649,7 +649,9 @@ class SessionManager:
         # resolve_turn_limit() also preserves supported unlimited spellings
         # instead of silently replacing them with an arbitrary numeric cap.
         agent_cfg = config.get("agent")
-        configured_max_turns = agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None
+        configured_max_turns = (
+            agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None
+        )
         if configured_max_turns is not None:
             kwargs["max_iterations"] = resolve_turn_limit(configured_max_turns)
 
