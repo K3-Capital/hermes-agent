@@ -324,7 +324,14 @@ _AWS_SDK_CREDENTIAL_ENV_VARS = frozenset({
 
 
 def _build_provider_env_blocklist() -> frozenset:
-    """Derive the blocklist from provider, tool, and gateway config."""
+    """Derive the blocklist from provider, tool, and gateway config.
+
+    Also folds in every egress-mapping family (canonical env names plus
+    aliases) so the scrub surfaces cover the operators' configured egress
+    credentials — the mapping families are the authoritative protected
+    set, not a stale snapshot of provider names.  Best-effort: a missing
+    or unreadable mappings file contributes nothing.
+    """
     blocked: set[str] = set()
 
     try:
@@ -441,6 +448,16 @@ def _build_provider_env_blocklist() -> frozenset:
     # instead a TERMINAL-ONLY, context-gated scrub-path exemption: see
     # ``_TERMINAL_FIRST_PARTY_ENV_PREFIXES`` / ``_is_terminal_first_party_env``
     # below (issue #78026 / #76243, PRs #78065 + #78511).
+    # Egress-mapping families (canonical env names + aliases) from the
+    # operator's persisted iron-proxy mappings — the authoritative
+    # protected set for enforced-egress deployments.  Best-effort: an
+    # unreadable/missing mappings file contributes nothing.
+    try:
+        from agent.proxy_sources.iron_proxy import family_env_names
+
+        blocked.update(family_env_names())
+    except Exception:
+        pass
     return frozenset(blocked)
 
 

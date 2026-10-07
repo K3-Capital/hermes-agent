@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import List
+from typing import Dict, List
 
 from rich.console import Console
 from rich.panel import Panel
@@ -199,6 +199,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         return 1
 
     available_env_names: List[str] = []
+    # Effective credential source for D5 value validation below: the BWS
+    # secret values when --from-bitwarden pulled them, otherwise the host
+    # process env (including ~/.hermes/.env loaded just below).
+    value_source: Dict[str, str] = {}
     if args.from_bitwarden:
         cfg = load_config()
         bw_cfg = (cfg.get("secrets") or {}).get("bitwarden") or {}
@@ -231,6 +235,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 use_cache=False,
             )
             available_env_names = list(secrets.keys())
+            value_source = dict(secrets)
             if not available_env_names:
                 console.print(
                     "  [red]✗ Bitwarden returned an empty secrets list.[/red]\n"
@@ -264,10 +269,32 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 f"  [dim]Loaded {loaded} provider key name(s) from "
                 f"~/.hermes/.env for discovery.[/dim]"
             )
+        value_source = dict(os.environ)
 
     discovered = ip.discover_provider_mappings(
         available_env_names=available_env_names or None,
     )
+
+    # D5 fail-closed value validation (frozen stage-1 requirement): every
+    # alias family must carry ONE non-empty credential value.  Conflicting
+    # values would otherwise be silently collapsed onto the canonical name
+    # at proxy start (or pick the wrong account after a rotation
+    # mismatch).  Validate BEFORE anything is persisted; name the
+    # variables only, never the values.
+    value_conflicts = ip.find_family_value_conflicts(
+        value_source, mappings=discovered,
+    )
+    if value_conflicts:
+        console.print(
+            "  [red]✗ conflicting credential values across alias families "
+            "(fail closed):[/red] " + ", ".join(value_conflicts)
+        )
+        console.print(
+            "  Each family (canonical name and all aliases) must carry ONE "
+            "non-empty value.  Nothing was written — align the conflicting "
+            "variables in your env / secrets source and rerun."
+        )
+        return 1
 
     # Preserve tokens for providers we already had unless the operator
     # explicitly requested rotation.  This prevents re-running `hermes

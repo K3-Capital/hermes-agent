@@ -397,3 +397,126 @@ def test_load_env_file_backfills_header_auth_names_and_aliases(hermes_home, monk
     assert os.environ.get("COINGECKO_API_KEY") == "coingecko-from-dotenv"
     assert "UNRELATED_NOT_A_PROVIDER" not in os.environ
     assert added >= 3
+
+
+# ---------------------------------------------------------------------------
+# D5: setup-time alias-family value validation (spec review S2-R2)
+# ---------------------------------------------------------------------------
+
+
+def _mock_setup_prereqs(monkeypatch, hermes_home):
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
+    monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
+    monkeypatch.setattr(
+        ip, "ensure_ca_cert",
+        lambda **kw: (hermes_home / "ca.crt", hermes_home / "ca.key"),
+    )
+
+
+def test_cmd_setup_fails_closed_on_family_value_conflicts(
+    hermes_home, monkeypatch, capsys,
+):
+    """Env-source setup: conflicting canonical/alias values refuse before
+    any state is persisted; output names variables, never values."""
+    _mock_setup_prereqs(monkeypatch, hermes_home)
+    monkeypatch.setenv("XAI_API_KEY", "synthetic-conflict-A")
+    monkeypatch.setenv("GROK_API_KEY", "synthetic-conflict-B")
+
+    rc = proxy_cli.cmd_setup(_args())
+    assert rc == 1
+
+    out = capsys.readouterr().out
+    assert "XAI_API_KEY" in out
+    assert "synthetic-conflict-A" not in out
+    assert "synthetic-conflict-B" not in out
+
+    state = ip._proxy_state_dir_ro()
+    assert not (state / "mappings.json").exists()
+    assert not (state / "proxy.yaml").exists()
+
+
+def test_cmd_setup_equal_alias_values_is_accepted(hermes_home, monkeypatch):
+    """Control: equal canonical/alias values must not block setup."""
+    _mock_setup_prereqs(monkeypatch, hermes_home)
+    monkeypatch.setenv("XAI_API_KEY", "same-value")
+    monkeypatch.setenv("GROK_API_KEY", "same-value")
+
+    rc = proxy_cli.cmd_setup(_args())
+    assert rc == 0
+    mappings = ip.load_mappings()
+    assert any(m.real_env_name == "XAI_API_KEY" for m in mappings)
+
+
+def test_cmd_setup_from_bitwarden_fails_closed_on_family_value_conflicts(
+    hermes_home, monkeypatch,
+):
+    """BWS-source setup: conflicting values inside the fetched secrets
+    refuse before any state is persisted."""
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg.setdefault("secrets", {})["bitwarden"] = {
+        "enabled": True,
+        "project_id": "test-proj",
+        "access_token_env": "BWS_ACCESS_TOKEN",
+    }
+    save_config(cfg)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "bwsk-test-token")
+    _mock_setup_prereqs(monkeypatch, hermes_home)
+
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"XAI_API_KEY": "synthetic-conflict-A",
+                       "GROK_API_KEY": "synthetic-conflict-B"}, []),
+    )
+
+    rc = proxy_cli.cmd_setup(_args(from_bitwarden=True))
+    assert rc == 1
+
+    state = ip._proxy_state_dir_ro()
+    assert not (state / "mappings.json").exists()
+    assert not (state / "proxy.yaml").exists()
+
+
+def test_cmd_start_fails_closed_when_family_values_conflict(
+    hermes_home, monkeypatch, capsys,
+):
+    """cmd_start funnels the D5 start-time refusal into rc=1 with the
+    conflict named and no proxy launched."""
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    save_config(cfg)
+
+    # A real-enough mapping family + conflicting host values.
+    ip.write_mappings([ip.TokenMapping(
+        proxy_token=ip.mint_proxy_token("fam"),
+        real_env_name="XAI_API_KEY",
+        upstream_hosts=("api.x.ai",),
+        alias_env_names=("GROK_API_KEY",),
+    )])
+    state = ip._proxy_state_dir()
+    (state / "ca.crt").write_text("fake-ca")
+    (state / "ca.key").write_text("fake-key")
+    cfg = ip.build_proxy_config(
+        mappings=ip.load_mappings(), ca_cert=state / "ca.crt",
+        ca_key=state / "ca.key",
+    )
+    ip.write_proxy_config(cfg)
+    monkeypatch.setenv("XAI_API_KEY", "synthetic-conflict-A")
+    monkeypatch.setenv("GROK_API_KEY", "synthetic-conflict-B")
+    # The real start_proxy must reach the D5 gate before any launch; only
+    # the binary lookup is mocked.
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: state / "iron-proxy")
+    monkeypatch.setattr(ip, "install_iron_proxy", lambda: state / "iron-proxy")
+
+    rc = proxy_cli.cmd_start(_args())
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "XAI_API_KEY" in out
+    assert "synthetic-conflict-A" not in out
+    assert "synthetic-conflict-B" not in out
+    # No daemon state was published.
+    assert not (state / "iron-proxy.pid").exists()

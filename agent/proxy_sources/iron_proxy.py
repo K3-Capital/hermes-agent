@@ -75,7 +75,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -1561,9 +1561,14 @@ def write_mappings(mappings: List[TokenMapping]) -> Path:
 
 
 def load_mappings() -> List[TokenMapping]:
-    """Read mappings.json, if it exists.  Empty list on any error."""
+    """Read mappings.json, if it exists.  Empty list on any error.
 
-    state = _proxy_state_dir()
+    Uses the read-only state-dir path: a pure reader must not materialize
+    ``~/.hermes/proxy/`` (this is called from hot paths such as skill
+    passthrough checks).
+    """
+
+    state = _proxy_state_dir_ro()
     f = state / "mappings.json"
     if not f.exists():
         return []
@@ -1766,6 +1771,76 @@ def find_registry_conflicts(
             elif prior != env_name:
                 conflicts.append(f"{name}: claimed by both {prior} and {env_name}")
     return conflicts
+
+
+def family_env_names(
+    mappings: Optional[List[TokenMapping]] = None,
+) -> Set[str]:
+    """Complete env-name families owned by the persisted token mappings.
+
+    A family is one mapping's canonical ``real_env_name`` plus every
+    member of its ``alias_env_names`` — the complete set of names that
+    share one credential value and one protection policy.  Protection
+    must derive from these authoritative families, never from naming
+    suffixes or a static blocklist: an alias such as ``TENDERLY_ACCESS_KEY``
+    carries no ``_API_KEY``/``_TOKEN`` suffix and must not slip through.
+    """
+    if mappings is None:
+        mappings = load_mappings()
+    names: Set[str] = set()
+    for m in mappings:
+        names.add(m.real_env_name)
+        names.update(getattr(m, "alias_env_names", ()) or ())
+    return names
+
+
+def is_egress_mapped_credential(
+    name: str,
+    mappings: Optional[List[TokenMapping]] = None,
+) -> bool:
+    """True when ``name`` is a canonical or alias name of an egress mapping.
+
+    Reads the persisted mappings on first call; pass ``mappings`` to check
+    against an explicit list.  Never raises — an unreadable mappings file
+    reads as "no mappings", matching ``load_mappings()``.
+    """
+    return name in family_env_names(mappings)
+
+
+def find_family_value_conflicts(
+    values: Mapping[str, str],
+    mappings: Optional[List[TokenMapping]] = None,
+) -> List[str]:
+    """Return canonical names whose alias family carries conflicting values.
+
+    Frozen stage-1 requirement D5: every member of a mapping family (the
+    canonical env name plus all aliases) must carry the SAME non-empty
+    credential value.  Empty and whitespace-only values count as absent.
+    Different non-empty values mean a rotation or credential-source
+    mismatch that would otherwise be silently collapsed onto one member —
+    callers fail closed instead.
+
+    Returns canonical env names only, so callers can surface the conflict
+    in logs and error messages without ever revealing a credential value.
+    """
+    if mappings is None:
+        mappings = load_mappings()
+    conflicts: List[str] = []
+    for m in mappings:
+        seen: Optional[str] = None
+        for name in (m.real_env_name, *(getattr(m, "alias_env_names", ()) or ())):
+            raw = values.get(name)
+            if raw is None:
+                continue
+            candidate = raw.strip()
+            if not candidate:
+                continue
+            if seen is None:
+                seen = candidate
+            elif candidate != seen:
+                conflicts.append(m.real_env_name)
+                break
+    return sorted(set(conflicts))
 
 
 # ---------------------------------------------------------------------------
@@ -2308,6 +2383,17 @@ def _kill_and_wait(proc: "subprocess.Popen", *, grace_seconds: int = 2) -> None:
             pass
 
 
+def _family_conflicts_error(conflicts: List[str]) -> RuntimeError:
+    """Build the D5 alias-family value-conflict error — names only, never values."""
+    return RuntimeError(
+        "Conflicting values across aliased credential families: "
+        + ", ".join(conflicts)
+        + ".  Every member of a family (canonical name and all aliases) must "
+        "carry ONE credential value; clear or align the conflicting "
+        "variables and retry.  (Conflicting values are never logged.)"
+    )
+
+
 def _build_proxy_subprocess_env(
     *,
     extra_env: Optional[Dict[str, str]] = None,
@@ -2338,26 +2424,41 @@ def _build_proxy_subprocess_env(
     # by ``m.real_env_name`` in the YAML config's ``secrets.source.var``
     # field.  Forward those — but only those.  For alias providers
     # (GEMINI_API_KEY / GOOGLE_API_KEY), the rule is keyed on the canonical
-    # name; when only the alias is set in the host env, mirror its value
+    # name; when only an alias is set in the host env, mirror its value
     # into the canonical name so the swap still has a real secret.
+    #
+    # D5: resolve each family through one shared value-validation path
+    # FIRST.  A family must carry one non-empty value — different
+    # canonical/alias (or alias/alias) values previously let the canonical
+    # win silently, which can select the wrong account after a rotation
+    # mismatch.  The error names variables only, never values.
+    mappings = load_mappings()
+    parent_conflicts = find_family_value_conflicts(parent, mappings=mappings)
+    if parent_conflicts:
+        raise _family_conflicts_error(parent_conflicts)
     alias_sources: Dict[str, Tuple[str, ...]] = {}
     needed = set()
-    for m in load_mappings():
+    for m in mappings:
         needed.add(m.real_env_name)
         if m.alias_env_names:
             alias_sources[m.real_env_name] = tuple(m.alias_env_names)
     for name in needed:
-        if name in parent:
-            env[name] = parent[name]
-        else:
-            for alias in alias_sources.get(name, ()):
-                if parent.get(alias):
-                    env[name] = parent[alias]
-                    break
+        # Empty/whitespace-only values count as absent; the first present
+        # non-empty value wins (canonical, then aliases in family order).
+        # Cross-member differences were already rejected above.
+        value: Optional[str] = None
+        for candidate_name in (name, *alias_sources.get(name, ())):
+            raw = parent.get(candidate_name)
+            if raw is not None and raw.strip():
+                value = raw
+                break
+        if value is not None:
+            env[name] = value
 
     # Optional Bitwarden refresh path.  Pulled lazily so the proxy module
     # doesn't hard-depend on the bitwarden module being importable in
     # every install.
+    bws_values: Dict[str, str] = {}
     if refresh_from_bitwarden and bitwarden_config:
         try:
             from agent.secret_sources import bitwarden as bw
@@ -2373,6 +2474,7 @@ def _build_proxy_subprocess_env(
                     cache_ttl_seconds=0,
                     use_cache=False,
                 )
+                bws_values = dict(secrets)
                 # Only inject env names we have a mapping for — extra
                 # secrets in the BW project shouldn't leak into the proxy
                 # process unless they're going to be used by the swap.
@@ -2462,6 +2564,26 @@ def _build_proxy_subprocess_env(
     # path.
     if extra_env:
         env.update(extra_env)
+
+    # D5, final pass: Bitwarden refresh and caller overrides can each be
+    # internally consistent while disagreeing with another source for the
+    # same family (e.g. freshly rotated canonical in BWS vs a stale alias
+    # still in the host env).  Validate the EFFECTIVE view — what the
+    # proxy will actually receive — with values from the merged env first,
+    # then the Bitwarden fetch, then the parent env standing in for any
+    # family member none of those restated.
+    effective_view: Dict[str, str] = {}
+    for m in mappings:
+        for name in (m.real_env_name, *(m.alias_env_names or ())):
+            if name in env:
+                effective_view[name] = env[name]
+            elif name in bws_values:
+                effective_view[name] = bws_values[name]
+            elif name in parent:
+                effective_view[name] = parent[name]
+    merged_conflicts = find_family_value_conflicts(effective_view, mappings=mappings)
+    if merged_conflicts:
+        raise _family_conflicts_error(merged_conflicts)
 
     # Strip proxy-recursion-risk vars regardless of how they got in.
     for name in _PROXY_SUBPROCESS_ENV_STRIP:

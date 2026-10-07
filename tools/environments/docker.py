@@ -644,17 +644,72 @@ def _egress_enforce_on_docker(default: bool = True) -> bool:
         return default
 
 
+# Egress-proxy control variables: forwarding or overriding any of these
+# can weaken the isolation regardless of provider.  They are also the
+# only override keys that are NOT egress-managed credential names.
+_EGRESS_CONTROL_ENV_NAMES = frozenset({
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "NO_PROXY", "no_proxy",
+    "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS", "NODE_OPTIONS",
+    "HERMES_EGRESS_PROXY", "_HERMES_EGRESS_NODE_OPTIONS_APPEND",
+})
+
+
+def _egress_family_env_names() -> set[str]:
+    """Complete egress-mapping families (canonical names + all aliases).
+
+    Derived from the authoritative persisted mappings — never from naming
+    suffixes or a static blocklist (aliases like ``TENDERLY_ACCESS_KEY``
+    have no ``_API_KEY``/``_TOKEN`` suffix).
+    """
+    try:
+        from agent.proxy_sources import iron_proxy as _ip_families
+
+        return set(_ip_families.family_env_names())
+    except Exception as exc:  # noqa: BLE001 — best-effort; fallback below
+        logger.debug("Docker: could not load egress mapping families: %s", exc)
+        return set()
+
+
+def _egress_family_token_map(env_overrides: dict[str, str]) -> dict[str, str]:
+    """Map every egress-managed env name to its opaque proxy token.
+
+    Sources: each authoritative mapping's canonical name plus its complete
+    alias family, with an ``env_overrides`` fallback so every
+    non-control, non-diagnostic override key stays protected even when the
+    mappings file can't be re-read (those keys exist only because a
+    mapping minted them).
+    """
+    tokens: dict[str, str] = {}
+    for name in _egress_family_env_names():
+        token = env_overrides.get(name)
+        if token:
+            tokens[name] = token
+    for key, value in env_overrides.items():
+        if key in tokens or not value:
+            continue
+        if key in _EGRESS_CONTROL_ENV_NAMES or key.startswith("HERMES_PROXY_TOKEN_"):
+            continue
+        tokens[key] = value
+    return tokens
+
+
 def _critical_egress_env_names(env_overrides: dict[str, str]) -> set[str]:
-    """Env names that would weaken or bypass enforced egress if overridden."""
-    critical = {
-        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-        "NO_PROXY", "no_proxy",
-        "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
-        "NODE_EXTRA_CA_CERTS", "NODE_OPTIONS",
-    }
+    """Env names that would weaken or bypass enforced egress if overridden.
+
+    Protected names are the complete mapping families — each mapping's
+    canonical env name and every alias (``family_env_names``) — not naming
+    suffixes or a static blocklist.  Every other non-diagnostic override
+    key is protected as a fallback, keeping the guard complete even if
+    the mappings file can't be re-read.
+    """
+    critical = set(_EGRESS_CONTROL_ENV_NAMES)
+    critical.update(_egress_family_env_names())
     critical.update(
         key for key in env_overrides
-        if key.endswith("_API_KEY") or key.endswith("_TOKEN")
+        if not key.startswith("HERMES_PROXY_TOKEN_")
+        and key not in _EGRESS_CONTROL_ENV_NAMES
     )
     return critical
 
@@ -1162,6 +1217,12 @@ class DockerEnvironment(BaseEnvironment):
         )
         _enforce_egress = _egress_enforce_on_docker()
         _critical_egress_names = _critical_egress_env_names(egress_env_overrides)
+        # Opaque-token policy for egress families: whatever later env
+        # resolution does (skill/config passthrough, late registration,
+        # exec/reuse), a mapped family name resolves to its proxy token —
+        # never the real host value.  Empty when egress is disabled for
+        # this container, preserving the proxy-disabled behavior.
+        self._egress_family_tokens = _egress_family_token_map(egress_env_overrides)
         if egress_env_overrides:
             _forward_collisions = sorted(
                 key for key in self._forward_env if key in _critical_egress_names
@@ -1229,15 +1290,16 @@ class DockerEnvironment(BaseEnvironment):
             # real provider keys.  `docker_env: {OPENROUTER_API_KEY: sk-real}`
             # in config.yaml puts the live secret into the sandbox while
             # egress is nominally enforced — defeats the entire feature.
-            # Pull the mapped real_env_name from each token mapping at
+            # Use the COMPLETE mapping families (canonical names AND
+            # aliases — an alias injects the same real secret), read at
             # call time so this stays in sync with whatever the operator
             # has configured.
             _critical_provider_keys: set[str] = set()
             try:
                 from agent.proxy_sources import iron_proxy as _ip_for_mappings
-                _critical_provider_keys = {
-                    m.real_env_name for m in _ip_for_mappings.load_mappings()
-                }
+                _critical_provider_keys = set(
+                    _ip_for_mappings.family_env_names()
+                )
             except Exception:  # noqa: BLE001 — best-effort collision check
                 pass
             _critical = _critical_proxy_control | _critical_provider_keys
@@ -1662,9 +1724,19 @@ class DockerEnvironment(BaseEnvironment):
             k for k in passthrough_keys if not _is_hermes_internal_secret(k)
         }
         forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        # Egress-mapped family names ALWAYS resolve to their opaque proxy
+        # token, never the host credential — the same value policy as the
+        # creation env, applied consistently at init, every later command,
+        # and after late skill/config registration (S2-R1).  The tokens map
+        # is empty when egress is disabled for this container, preserving
+        # the proxy-disabled behavior.
+        family_tokens = getattr(self, "_egress_family_tokens", None) or {}
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         unset_names: set[str] = set()
         for key in sorted(forward_keys):
+            if key in family_tokens:
+                exec_env[key] = family_tokens[key]
+                continue
             value = os.getenv(key) or hermes_env.get(key)
             if resolve_passthrough_value is not None:
                 value = resolve_passthrough_value(key, value)

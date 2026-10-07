@@ -1167,3 +1167,161 @@ def test_missing_required_mapping_refuses_before_container_creation(hermes_home,
     assert env.get("OPENROUTER_API_KEY") == mapping.proxy_token
 
 
+
+
+# ---------------------------------------------------------------------------
+# D5: alias-family credential-VALUE validation (spec review S2-R2)
+# ---------------------------------------------------------------------------
+
+# Frozen families used by the value-validation matrix (canonical, aliases)
+_FAMILY_MATRIX = [
+    ("XAI_API_KEY", ("GROK_API_KEY", "XAI_GROK_API_KEY")),
+    ("TENDERLY_ACCESS_TOKEN", ("TENDERLY_ACCESS_KEY", "TENDERLY_API_KEY")),
+    ("COINGECKO_DEMO_API_KEY", ("COINGECKO_API_KEY",)),
+]
+
+
+def _family_mapping(canonical: str, aliases=()) -> ip.TokenMapping:
+    return ip.TokenMapping(
+        proxy_token=ip.mint_proxy_token("fam"),
+        real_env_name=canonical,
+        upstream_hosts=("api.family.test",),
+        alias_env_names=tuple(aliases),
+    )
+
+
+@pytest.mark.parametrize("canonical,aliases", _FAMILY_MATRIX)
+def test_family_value_conflicts_matrix(canonical, aliases):
+    """One non-empty value (or equal repeats) passes; different non-empty
+    values fail closed; empty/whitespace values count as absent."""
+    m = [_family_mapping(canonical, aliases)]
+    alias0 = aliases[0]
+    ok_cases = [
+        {canonical: "v1"},                 # canonical-only
+        {alias0: "v1"},                    # alias-only
+        {canonical: "v1", alias0: "v1"},   # equal values
+        {canonical: "", alias0: "v1"},     # empty canonical
+        {canonical: "   ", alias0: "v1"},  # whitespace-only canonical
+        {canonical: "v1", alias0: " v1 "}, # whitespace-equal
+        {},                                # nothing set
+    ]
+    for values in ok_cases:
+        assert ip.find_family_value_conflicts(values, mappings=m) == [], values
+    # canonical/alias conflict → canonical named, no values returned
+    conflicts = ip.find_family_value_conflicts({canonical: "v1", alias0: "v2"}, mappings=m)
+    assert conflicts == [canonical]
+    if len(aliases) > 1:
+        alias1 = aliases[1]
+        assert ip.find_family_value_conflicts({alias0: "a", alias1: "b"}, mappings=m) == [canonical]
+        assert ip.find_family_value_conflicts({alias0: "a", alias1: "a"}, mappings=m) == []
+
+
+@pytest.mark.parametrize("canonical,aliases", _FAMILY_MATRIX)
+def test_build_proxy_subprocess_env_rejects_conflicting_family_values(
+    hermes_home, monkeypatch, canonical, aliases,
+):
+    """Reviewed repro: conflicting canonical/alias values must fail closed
+    at proxy start — and the error must never reveal a value."""
+    ip.write_mappings([_family_mapping(canonical, aliases)])
+    monkeypatch.setenv(canonical, "synthetic-conflict-A")
+    monkeypatch.setenv(aliases[0], "synthetic-conflict-B")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ip._build_proxy_subprocess_env()
+
+    message = str(excinfo.value)
+    assert canonical in message
+    assert "synthetic-conflict-A" not in message
+    assert "synthetic-conflict-B" not in message
+
+
+def test_build_proxy_subprocess_env_equal_values_control(hermes_home, monkeypatch):
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    monkeypatch.setenv("XAI_API_KEY", "same-value")
+    monkeypatch.setenv("GROK_API_KEY", "same-value")
+    env = ip._build_proxy_subprocess_env()
+    assert env.get("XAI_API_KEY") == "same-value"
+
+
+def test_build_proxy_subprocess_env_alias_only_mirrors_canonical(hermes_home, monkeypatch):
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    monkeypatch.setenv("GROK_API_KEY", "alias-value")
+    env = ip._build_proxy_subprocess_env()
+    assert env.get("XAI_API_KEY") == "alias-value"
+
+
+def test_build_proxy_subprocess_env_empty_canonical_uses_alias(hermes_home, monkeypatch):
+    ip.write_mappings([
+        _family_mapping("TENDERLY_ACCESS_TOKEN", ("TENDERLY_ACCESS_KEY",)),
+    ])
+    monkeypatch.setenv("TENDERLY_ACCESS_TOKEN", "   ")
+    monkeypatch.setenv("TENDERLY_ACCESS_KEY", "alias-value")
+    env = ip._build_proxy_subprocess_env()
+    assert env.get("TENDERLY_ACCESS_TOKEN") == "alias-value"
+
+
+def test_build_proxy_subprocess_env_rotation_mismatch_fails_at_restart(hermes_home, monkeypatch):
+    """Restart/rotation semantics: build once with equal values, then
+    re-run with a half-rotated family (canonical rotated, alias stale) —
+    the second start must fail closed."""
+    ip.write_mappings([_family_mapping("COINGECKO_DEMO_API_KEY", ("COINGECKO_API_KEY",))])
+    monkeypatch.setenv("COINGECKO_DEMO_API_KEY", "v1")
+    monkeypatch.setenv("COINGECKO_API_KEY", "v1")
+    assert ip._build_proxy_subprocess_env().get("COINGECKO_DEMO_API_KEY") == "v1"
+
+    monkeypatch.setenv("COINGECKO_DEMO_API_KEY", "v2")  # rotated; alias stale
+    with pytest.raises(RuntimeError, match="COINGECKO_DEMO_API_KEY"):
+        ip._build_proxy_subprocess_env()
+
+
+def test_build_proxy_subprocess_env_extra_env_conflict_fails_closed(hermes_home, monkeypatch):
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    monkeypatch.setenv("XAI_API_KEY", "v")
+    monkeypatch.setenv("GROK_API_KEY", "v")
+    with pytest.raises(RuntimeError, match="XAI_API_KEY"):
+        ip._build_proxy_subprocess_env(extra_env={"XAI_API_KEY": "other"})
+
+
+def test_build_proxy_subprocess_env_rejects_bws_internal_conflict(hermes_home, monkeypatch):
+    """A Bitwarden project carrying two different values across one family
+    fails closed instead of silently collapsing onto the canonical."""
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"XAI_API_KEY": "fresh-A", "GROK_API_KEY": "fresh-B"}, []),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ip._build_proxy_subprocess_env(refresh_from_bitwarden=True, bitwarden_config=cfg)
+    assert "XAI_API_KEY" in str(excinfo.value)
+    assert "fresh-A" not in str(excinfo.value)
+    assert "fresh-B" not in str(excinfo.value)
+
+
+def test_build_proxy_subprocess_env_rejects_parent_alias_vs_bws_rotation(
+    hermes_home, monkeypatch,
+):
+    """Cross-source conflict: freshly rotated canonical in BWS vs a stale
+    alias still present in the host env fails closed."""
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    monkeypatch.setenv("GROK_API_KEY", "stale-alias")
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"XAI_API_KEY": "rotated"}, []),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+
+    with pytest.raises(RuntimeError, match="XAI_API_KEY"):
+        ip._build_proxy_subprocess_env(refresh_from_bitwarden=True, bitwarden_config=cfg)
+
+
+def test_family_env_names_reads_persisted_mappings(hermes_home):
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY", "XAI_GROK_API_KEY"))])
+    assert ip.family_env_names() == {"XAI_API_KEY", "GROK_API_KEY", "XAI_GROK_API_KEY"}
+    assert ip.is_egress_mapped_credential("GROK_API_KEY") is True
+    assert ip.is_egress_mapped_credential("TENOR_API_KEY") is False

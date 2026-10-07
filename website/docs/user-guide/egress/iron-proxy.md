@@ -188,7 +188,19 @@ The `secrets` transform swaps the proxy token wherever it appears in a matched l
 
 Aliased names (`GOOGLE_API_KEY`, `GROK_API_KEY`, `XAI_GROK_API_KEY`, `COINGECKO_API_KEY`, `TENDERLY_ACCESS_KEY`, `TENDERLY_API_KEY`) are the SAME upstream credential as their canonical name: one proxy token is minted and injected under every name, and any of them in your host env satisfies discovery. The same env name is never owned by two providers — a conflicting registry fails `hermes egress setup` closed.
 
+An alias *family* must also carry ONE credential value: if two non-empty values disagree across a canonical name and its aliases (or across two aliases), `hermes egress setup` refuses to persist anything and `hermes egress start` / `restart` refuses to launch the proxy — names are reported, values never are. Empty and whitespace-only values count as absent. A half-finished rotation that leaves a stale alias behind stops loudly instead of silently selecting one of two keys.
+
+**Family protection is end to end, not just at container creation.** Every canonical/alias name is derived from the mappings you actually minted (never from naming suffixes), and that complete family:
+
+- refuses `docker_forward_env`, `docker_env` and `docker_extra_args` entries that name one of its members (sandbox creation fails before any container exists, under `enforce_on_docker: true`),
+- is refused by skill/config env passthrough registration — a skill that declares e.g. `ARKHAM_API_KEY` or `TENDERLY_ACCESS_KEY` cannot tunnel the real host credential into a child process,
+- resolves to the OPAQUE proxy token on every path that could otherwise inject a host value (init, every later command, and after late skill registration).
+
+Unconfigured third-party credentials (`TENOR_API_KEY`, `NOTION_TOKEN`, …) are unaffected — they were never part of an egress family and keep passing through. With the proxy disabled there are no families and the pre-egress behavior is unchanged.
+
 Every rule also carries a per-host method scope (e.g. `POST` for OpenRouter, `GET`/`HEAD`/`POST` for Etherscan, `GET`/`HEAD`/`POST`/`PUT`/`PATCH`/`DELETE` elsewhere). Requests outside the scope pass the proxy without substitution — that is what keeps public endpoints such as the OpenRouter model catalog working. `CONNECT` is never part of a method scope: the tunnel that opens each HTTPS connection must pass before the client can send the token.
+
+**Etherscan location-matching caveat:** the generated Etherscan rule enables header scanning (`match_headers: []`) and query scanning (`match_query: true`). iron-proxy v0.39 treats those as "scan every header / every parameter" — there is no per-parameter name filter, so `apikey` names the parameter the SDK actually uses, not an enforced allowlist of parameter names. The rule still substitutes only requests that carry the proxy token, and the method scope still applies.
 
 `GEMINI_API_KEY` and `GOOGLE_API_KEY` are treated as one credential: a single proxy token is minted and injected into the sandbox under **both** names, and either name in your host env satisfies discovery.
 
@@ -406,7 +418,7 @@ This is a known v1 limitation. Track [github.com/ironsh/iron-proxy/issues](https
 If you set proxy-controlling env vars in your `docker_env:` config block (rare but possible), Hermes refuses to start the sandbox when `enforce_on_docker: true` is set. This includes both:
 
 - Egress-control vars: `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`
-- Real provider env vars: every name in `mappings.json` (e.g. `OPENROUTER_API_KEY`, `OPENAI_API_KEY`)
+- Real provider env vars: every name in the COMPLETE alias families from `mappings.json` — canonical names AND aliases (e.g. `OPENROUTER_API_KEY`, `ARKHAM_API_KEY`, `GROK_API_KEY`, `TENDERLY_ACCESS_KEY`). An alias injects the same real secret as its canonical name, so neither is allowed in `docker_env`.
 
 Example error:
 
@@ -465,8 +477,9 @@ If the nonce check fails, the code falls back to matching `argv[0]` basename aga
 - **Upstream-host denied** — sandbox gets HTTP 403 from the proxy with a body explaining which host wasn't allowed. The agent sees the error and reports it.
 - **Cloud metadata IP (169.254.169.254) requested** — refused by `upstream_deny_cidrs` regardless of allowlist.
 - **`docker_env` collides with a proxy-controlling var (enforce on)** — sandbox creation refuses with the names of the colliding keys.
-- **`docker_forward_env` tries to forward a protected provider key (enforce on)** — sandbox creation refuses; remove the key from `docker_forward_env` or opt out with `proxy.enforce_on_docker: false`.
+- **`docker_forward_env` tries to forward a protected provider key (enforce on)** — sandbox creation refuses; remove the key from `docker_forward_env` or opt out with `proxy.enforce_on_docker: false`. This covers every alias family member, not just names with an `_API_KEY`/`_TOKEN` suffix.
 - **`docker_extra_args` overrides proxy env/network controls (enforce on)** — sandbox creation refuses; user-supplied `-e HTTPS_PROXY=...`, `--env-file`, or `--network` args run after Hermes' generated args and can bypass egress.
+- **Conflicting values across an alias family** — `hermes egress setup` refuses before writing anything; `hermes egress start` / `restart` refuses to launch and names the conflicting families (values are never printed). Align or clear the disagreeing variables (a half-finished rotation is the common cause) and retry.
 - **BWS access token missing in `credential_source: bitwarden`** — `hermes egress start` refuses with `--no-bitwarden` as the recovery hint.
 - **iron-proxy doesn't bind within 5 seconds** — process is killed, pidfile unlinked, error names the port + tail of `iron-proxy.log`.
 - **Concurrent `hermes egress start` calls** — second call refuses with "another start in progress" if the first's daemon is up; otherwise the second unlinks the stale pidfile and proceeds.

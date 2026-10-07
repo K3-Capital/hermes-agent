@@ -49,7 +49,8 @@ _config_passthrough: frozenset[str] | None = None
 
 def _is_hermes_provider_credential(name: str) -> bool:
     """True if ``name`` is a Hermes-managed provider credential (API key,
-    token, or similar) per ``_HERMES_PROVIDER_ENV_BLOCKLIST``.
+    token, or similar) per ``_HERMES_PROVIDER_ENV_BLOCKLIST`` or an
+    egress-mapping family.
 
     Skill-declared ``required_environment_variables`` frontmatter must
     not be able to override this list — that was the bypass in
@@ -58,9 +59,15 @@ def _is_hermes_provider_credential(name: str) -> bool:
     the credential in the ``execute_code`` child process, defeating the
     sandbox's scrubbing guarantee.
 
-    Non-Hermes API keys (TENOR_API_KEY, NOTION_TOKEN, etc.) are NOT
-    in the blocklist and remain legitimately registerable — skills that
-    wrap third-party APIs still work.
+    Egress-mapping families (``agent.proxy_sources.iron_proxy``) are
+    protected for the same reason: under enforced egress the sandbox
+    receives only opaque proxy tokens, and a skill registering e.g.
+    ``ARKHAM_API_KEY`` or ``TENDERLY_ACCESS_KEY`` must not tunnel the
+    real host credential into a child process.  The family set derives
+    from the operator's own mappings (canonical name + complete alias
+    family — never naming suffixes or a stale list), so unconfigured
+    third-party credentials (TENOR_API_KEY, NOTION_TOKEN, ...) remain
+    legitimately registerable.
 
     Fail closed: if the authoritative blocklist cannot be imported (partial
     install, import-time error, etc.) we treat the name as a protected
@@ -87,7 +94,21 @@ def _is_hermes_provider_credential(name: str) -> bool:
     # as passthrough and tunnel them into an execute_code / terminal child.
     if _is_hermes_internal_secret(name):
         return True
-    return name in _HERMES_PROVIDER_ENV_BLOCKLIST
+    if name in _HERMES_PROVIDER_ENV_BLOCKLIST:
+        return True
+    # Egress-mapping families: canonical name plus every alias (S2-R1).
+    try:
+        from agent.proxy_sources.iron_proxy import is_egress_mapped_credential
+
+        return is_egress_mapped_credential(name)
+    except Exception as e:
+        logger.warning(
+            "env passthrough: egress mapping family check failed; failing "
+            "closed and refusing passthrough registration for %r: %s",
+            name,
+            e,
+        )
+        return True
 
 
 def register_env_passthrough(var_names: Iterable[str]) -> None:
@@ -113,9 +134,11 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
         if _is_hermes_provider_credential(name):
             logger.warning(
                 "env passthrough: refusing to register Hermes provider "
-                "credential %r (blocked by _HERMES_PROVIDER_ENV_BLOCKLIST). "
-                "Skills must not override the execute_code sandbox's "
-                "credential scrubbing; see GHSA-rhgp-j443-p4rf.",
+                "credential %r (blocked by the provider-credential "
+                "protection: _HERMES_PROVIDER_ENV_BLOCKLIST or an "
+                "egress-mapping family). Skills must not override the "
+                "execute_code sandbox's credential scrubbing; see "
+                "GHSA-rhgp-j443-p4rf.",
                 name,
             )
             continue
