@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -73,6 +74,23 @@ def egress_state(tmp_path, monkeypatch):
     return SimpleNamespace(mappings=mappings, tokens=tokens, ca=ca, home=home)
 
 
+def write_raw_proxy_config(home, *, enabled: bool, enforce: bool = True) -> None:
+    """Write the config.yaml the ACTIVE-integration checks read (S2-R3).
+
+    ``env_passthrough`` reads the raw profile config to decide whether the
+    mapping-family policy applies; the Docker backend reads the same values
+    through its own (separately patched) loader.  Keeping the file in sync
+    with the simulated state is what makes the enabled/disabled controls
+    meaningful.
+    """
+    import yaml
+
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"proxy": {"enabled": enabled, "enforce_on_docker": enforce}}),
+        encoding="utf-8",
+    )
+
+
 class Build:
     """Result of one mocked DockerEnvironment construction."""
 
@@ -112,6 +130,13 @@ def build_environment(
     """
     env_passthrough.clear_env_passthrough()
     env_passthrough._config_passthrough = frozenset()
+    # The mapping-family policy is scoped to an ACTIVE integration (S2-R3):
+    # keep the profile config in sync with the simulated proxy state.
+    write_raw_proxy_config(
+        getattr(egress_state, "home", Path("/nonexistent")),
+        enabled=proxy_enabled,
+        enforce=enforce,
+    )
     if skill_names:
         env_passthrough.register_env_passthrough(skill_names)
 
@@ -251,8 +276,10 @@ def test_skill_passthrough_of_mapped_families_delivers_only_tokens(egress_state)
 
 
 def test_registration_gate_refuses_mapped_families(egress_state):
-    """The registration gate itself is family-aware: mapped canonical and
-    alias names are refused; unconfigured third-party names still register."""
+    """While the integration is ACTIVE, the registration gate is
+    family-aware: mapped canonical and alias names are refused; unconfigured
+    third-party names still register."""
+    write_raw_proxy_config(egress_state.home, enabled=True)
     env_passthrough.clear_env_passthrough()
     env_passthrough.register_env_passthrough(
         [*ACTIVE_NAMES, "GROK_API_KEY", NON_FAMILY_NAME],
@@ -359,9 +386,12 @@ def test_docker_env_collision_control_still_rejects_canonical(egress_state):
     assert rec.run_calls == 0
 
 
-def test_enforce_off_warns_and_keeps_no_raw_value_in_sandbox(egress_state):
-    """Documented opt-out: enforce_on_docker=false downgrades to a warning,
-    but family values still never enter the sandbox as raw host values."""
+def test_enforce_off_forward_still_uses_token(egress_state):
+    """Documented opt-out, explicit-forward case: enforce_on_docker=false
+    downgrades the refusal to a warning, and the resolver still supplies the
+    OPAQUE token for a forwarded family name.  (The opt-out does allow
+    explicit docker_env values and inline ``-e NAME=value`` extras — those
+    are the operator's deliberate escape hatch, see the next test.)"""
     rec = build_environment(
         egress_state,
         forward_names=("TENDERLY_ACCESS_KEY",),
@@ -375,13 +405,70 @@ def test_enforce_off_warns_and_keeps_no_raw_value_in_sandbox(egress_state):
         assert values.get("TENDERLY_ACCESS_KEY") != HOST_SECRET
 
 
-def test_proxy_disabled_preserves_legacy_passthrough(egress_state):
-    """Proxy disabled → no egress overrides, no family interception: the
-    pre-egress passthrough behavior is preserved."""
+def test_enforce_off_permits_explicit_docker_env_override(egress_state):
+    """The documented opt-out keeps its escape hatch: with enforcement off,
+    an explicit ``docker_env`` value reaches creation and init (warned, not
+    refused).  This is the operator's deliberate choice, not an enforced
+    mode path."""
+    rec = build_environment(
+        egress_state,
+        docker_env={"TENDERLY_ACCESS_KEY": OVERRIDE_VALUE},
+        enforce=False,
+    )
+    assert not rec.rejected, rec.error
+    assert rec.run_envs[0].get("TENDERLY_ACCESS_KEY") == OVERRIDE_VALUE
+    assert rec.instance._init_env_values.get("TENDERLY_ACCESS_KEY") == OVERRIDE_VALUE
+
+
+def test_enforce_off_permits_inline_extra_arg_override(egress_state):
+    """Same escape hatch via ``docker_extra_args``: an inline
+    ``-e NAME=value`` survives into the created container's args."""
+    rec = build_environment(
+        egress_state,
+        extra_args=["-e", f"TENDERLY_ACCESS_KEY={OVERRIDE_VALUE}"],
+        enforce=False,
+    )
+    assert not rec.rejected, rec.error
+    assert f"TENDERLY_ACCESS_KEY={OVERRIDE_VALUE}" in rec.instance._all_run_args
+
+
+def test_proxy_disabled_forwards_previously_mapped_name(egress_state):
+    """S2-R3: with the proxy disabled but mappings retained, a previously
+    mapped third-party credential keeps its pre-egress passthrough — the
+    family policy is scoped to an ACTIVE integration."""
+    rec = build_environment(egress_state, skill_names=("ARKHAM_API_KEY",), proxy_enabled=False)
+    assert not rec.rejected, rec.error
+    assert rec.instance._egress_family_tokens == {}
+    assert rec.instance._init_env_values.get("ARKHAM_API_KEY") == HOST_SECRET
+
+
+def test_proxy_disabled_unmapped_control_forwards_too(egress_state):
+    """Control: the same disabled configuration with an unmapped name."""
     rec = build_environment(egress_state, skill_names=(NON_FAMILY_NAME,), proxy_enabled=False)
     assert not rec.rejected, rec.error
     assert rec.instance._egress_family_tokens == {}
     assert rec.instance._init_env_values.get(NON_FAMILY_NAME) == HOST_SECRET
+
+
+def test_same_process_disable_restores_passthrough(egress_state):
+    """S2-R3: toggling ``proxy.enabled`` in one process must take effect —
+    the family gate is evaluated per registration, not cached at import.
+    The static Hermes provider scrub stays in force either way."""
+    write_raw_proxy_config(egress_state.home, enabled=True)
+    env_passthrough.clear_env_passthrough()
+    env_passthrough.register_env_passthrough(["ARKHAM_API_KEY", "OPENROUTER_API_KEY"])
+    allowed = env_passthrough.get_all_passthrough()
+    assert "ARKHAM_API_KEY" not in allowed      # family: refused while active
+    assert "OPENROUTER_API_KEY" not in allowed  # static blocklist: always refused
+
+    # Same process, same mappings: disable the integration.
+    write_raw_proxy_config(egress_state.home, enabled=False)
+    env_passthrough.clear_env_passthrough()
+    env_passthrough.register_env_passthrough(["ARKHAM_API_KEY", "OPENROUTER_API_KEY"])
+    allowed = env_passthrough.get_all_passthrough()
+    assert "ARKHAM_API_KEY" in allowed          # passthrough restored
+    assert "OPENROUTER_API_KEY" not in allowed  # scrub preserved
+    env_passthrough.clear_env_passthrough()
 
 
 # ---------------------------------------------------------------------------
@@ -421,11 +508,153 @@ def test_token_map_derives_families_and_falls_back_to_overrides(egress_state):
     assert fallback.get("TENDERLY_ACCESS_KEY") == "opaque-token-x"
 
 
-def test_blocklist_builder_folds_in_egress_families(egress_state):
-    """The derived provider blocklist covers the operator's mapping
-    families (canonical + aliases) — the authoritative protected set."""
+def test_blocklist_builder_does_not_fold_egress_families(egress_state):
+    """S2-R3: the import-time provider blocklist stays independent of the
+    optional egress integration — mapping families are NOT folded in, so a
+    proxy-disabled profile cannot keep the family policy alive globally.
+    Hermes-managed provider names stay blocked."""
     from tools.environments import local as local_module
 
     rebuilt = local_module._build_provider_env_blocklist()
+    # Names that are ONLY egress families (not Hermes-auth-registry providers)
+    # must not appear: folding them in would keep the policy alive globally
+    # even after `hermes egress disable`.
+    for name in (
+        "ARKHAM_API_KEY",
+        "TENDERLY_ACCESS_KEY",
+        "TENDERLY_API_KEY",
+        "ETHERSCAN_API_KEY",
+        "GROK_API_KEY",
+        "XAI_GROK_API_KEY",
+        "COINGECKO_DEMO_API_KEY",
+        "COINGECKO_API_KEY",
+    ):
+        assert name not in rebuilt, name
+    assert "OPENROUTER_API_KEY" in rebuilt  # existing Hermes scrub preserved
+
+
+def test_protected_snapshot_is_complete_without_a_second_mappings_read(egress_state):
+    """S2-R1: both halves of the protected snapshot derive from the SAME
+    export — an unreadable mappings file cannot empty them."""
+    overrides = {
+        **{n: t for n, t in egress_state.tokens.items()},
+        "HTTPS_PROXY": "http://host.docker.internal:18080",
+        "HERMES_PROXY_TOKEN_ARKHAM_API_KEY": egress_state.tokens["ARKHAM_API_KEY"],
+    }
+    with patch.object(ip, "load_mappings", side_effect=OSError("unreadable")):
+        critical, providers = docker_module._egress_protected_snapshot(overrides)
     for name in egress_state.tokens:
-        assert name in rebuilt, name
+        assert name in critical, name
+        assert name in providers, name
+    assert "HERMES_PROXY_TOKEN_ARKHAM_API_KEY" not in providers
+    assert "HTTPS_PROXY" not in providers
+
+
+# ---------------------------------------------------------------------------
+# S2-R1: a later unavailable/corrupt/partial mappings read must not empty
+# any guard — the export snapshot is reused for every collision check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["TENDERLY_ACCESS_KEY", "GROK_API_KEY", "ARKHAM_API_KEY"],
+)
+@pytest.mark.parametrize("artifact", ["missing", "corrupt", "partial"])
+def test_enforced_collision_refused_when_mappings_read_fails_after_export(
+    egress_state, monkeypatch, name, artifact,
+):
+    """Reviewed repro: a valid native export mints the complete token
+    overrides; the mappings file then becomes unavailable.  The
+    ``docker_env`` collision guard must still refuse — before any run."""
+    mapping_file = egress_state.home / "proxy" / "mappings.json"
+    original = mapping_file.read_bytes()
+    real_export = docker_module._egress_proxy_args_for_docker
+
+    def export_then_break():
+        args = real_export()
+        assert name in args[1], "fixture must export the complete overrides"
+        if artifact == "missing":
+            mapping_file.unlink()
+        elif artifact == "corrupt":
+            mapping_file.write_bytes(b"{ not json")
+        else:
+            mapping_file.write_bytes(original[: len(original) // 2])
+        return args
+
+    with patch.object(
+        docker_module, "_egress_proxy_args_for_docker", side_effect=export_then_break,
+    ):
+        rec = build_environment(egress_state, docker_env={name: OVERRIDE_VALUE})
+
+    assert rec.rejected, f"{name}/{artifact}: collision must fail closed"
+    assert rec.run_calls == 0, "no container may be created"
+    assert rec.exec_calls == [], "no init/exec path may run"
+    assert OVERRIDE_VALUE not in str(rec.error)
+
+
+@pytest.mark.parametrize(
+    "name", ["TENDERLY_ACCESS_KEY", "GROK_API_KEY", "ARKHAM_API_KEY"],
+)
+def test_enforced_forward_refused_when_mappings_read_fails_after_export(
+    egress_state, name,
+):
+    """Sibling guard: explicit forwarding of a family member is refused on
+    the same after-export failure."""
+    mapping_file = egress_state.home / "proxy" / "mappings.json"
+    real_export = docker_module._egress_proxy_args_for_docker
+
+    def export_then_remove():
+        args = real_export()
+        mapping_file.unlink()
+        return args
+
+    with patch.object(
+        docker_module, "_egress_proxy_args_for_docker", side_effect=export_then_remove,
+    ):
+        rec = build_environment(egress_state, forward_names=(name,))
+
+    assert rec.rejected, f"{name}: forward must fail closed"
+    assert rec.run_calls == 0
+
+
+def test_valid_export_builds_with_token_only_init_values(egress_state):
+    """Control: with the mappings file intact the same construction
+    succeeds and every family value at the exec boundary is the opaque
+    token (or absent) — never the host or configured value."""
+    rec = build_environment(
+        egress_state, passthrough_override=ACTIVE_NAMES,
+    )
+    assert not rec.rejected, rec.error
+    assert rec.run_calls == 1
+    for names, values in rec.exec_calls:
+        for name in names:
+            assert values.get(name) != HOST_SECRET, name
+            if name in egress_state.tokens:
+                assert values.get(name) == egress_state.tokens[name], name
+
+
+def test_recovery_reuses_saved_token_policy_when_mappings_read_fails(egress_state):
+    """S2-R1 recovery control: container reuse plus a later unavailable
+    mappings read still forwards family names as opaque tokens."""
+    rec = build_environment(egress_state)
+    assert not rec.rejected, rec.error
+    instance = rec.instance
+    instance._container_id = "synthetic-old-container"
+    instance._find_reusable_container = lambda *args: ("synthetic-recovery-container", "running")
+
+    with patch.object(instance, "init_session", return_value=None), \
+            patch.object(ip, "load_mappings", return_value=[]):
+        recovered = instance._recreate_container()
+        assert recovered
+        with patch.object(
+            env_passthrough,
+            "get_all_passthrough",
+            return_value=frozenset(egress_state.tokens),
+        ), patch.dict(os.environ, {n: HOST_SECRET for n in egress_state.tokens}):
+            _args, _unset, values = instance._build_runtime_env_args_with_unsets()
+
+    forwarded = {n: v for n, v in values.items() if n in egress_state.tokens}
+    assert forwarded, "family names must still be forwarded"
+    for name, value in forwarded.items():
+        assert value == egress_state.tokens[name], name
+    instance._container_id = None

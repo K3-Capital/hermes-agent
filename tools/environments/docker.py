@@ -698,20 +698,41 @@ def _egress_family_token_map(env_overrides: dict[str, str]) -> dict[str, str]:
 def _critical_egress_env_names(env_overrides: dict[str, str]) -> set[str]:
     """Env names that would weaken or bypass enforced egress if overridden.
 
-    Protected names are the complete mapping families — each mapping's
-    canonical env name and every alias (``family_env_names``) — not naming
-    suffixes or a static blocklist.  Every other non-diagnostic override
-    key is protected as a fallback, keeping the guard complete even if
-    the mappings file can't be re-read.
+    Thin wrapper over :func:`_egress_protected_snapshot`; callers that also
+    need the provider-credential subset should take the snapshot once and
+    reuse both halves (S2-R1).
     """
-    critical = set(_EGRESS_CONTROL_ENV_NAMES)
-    critical.update(_egress_family_env_names())
-    critical.update(
+    return _egress_protected_snapshot(env_overrides)[0]
+
+
+def _egress_protected_snapshot(
+    env_overrides: dict[str, str],
+) -> tuple[set[str], set[str]]:
+    """Authoritative protected env names from ONE derivation (S2-R1).
+
+    Returns ``(critical_names, provider_credential_names)``:
+
+    * ``critical_names`` — control vars plus every egress-managed override
+      name: forwarding or re-declaring any of them can weaken the posture.
+    * ``provider_credential_names`` — the mapping families (each canonical
+      env name plus every alias) plus every other non-control override
+      key: a ``docker_env`` entry naming one of these injects a real
+      credential into the sandbox.
+
+    Both halves derive from the persisted mappings AND the overrides
+    produced by the successful export, so a later unavailable, corrupt or
+    partial ``mappings.json`` read cannot empty a guard whose sibling
+    already resolved the complete set.
+    """
+    families = _egress_family_env_names()
+    override_keys = {
         key for key in env_overrides
         if not key.startswith("HERMES_PROXY_TOKEN_")
         and key not in _EGRESS_CONTROL_ENV_NAMES
-    )
-    return critical
+    }
+    critical = set(_EGRESS_CONTROL_ENV_NAMES) | families | override_keys
+    providers = families | override_keys
+    return critical, providers
 
 
 def _extra_args_egress_collisions(
@@ -1216,7 +1237,14 @@ class DockerEnvironment(BaseEnvironment):
             egress_volume_args, egress_env_overrides, egress_host_args,
         )
         _enforce_egress = _egress_enforce_on_docker()
-        _critical_egress_names = _critical_egress_env_names(egress_env_overrides)
+        # ONE authoritative protected snapshot for every guard, taken while
+        # the export succeeded.  A later unreadable/corrupt/partial
+        # mappings.json read must not empty a sibling guard (S2-R1): the
+        # env-overrides fallback keeps both the critical-name set and the
+        # provider-credential set complete.
+        _critical_egress_names, _egress_provider_names = _egress_protected_snapshot(
+            egress_env_overrides,
+        )
         # Opaque-token policy for egress families: whatever later env
         # resolution does (skill/config passthrough, late registration,
         # exec/reuse), a mapped family name resolves to its proxy token —
@@ -1290,18 +1318,12 @@ class DockerEnvironment(BaseEnvironment):
             # real provider keys.  `docker_env: {OPENROUTER_API_KEY: sk-real}`
             # in config.yaml puts the live secret into the sandbox while
             # egress is nominally enforced — defeats the entire feature.
-            # Use the COMPLETE mapping families (canonical names AND
-            # aliases — an alias injects the same real secret), read at
-            # call time so this stays in sync with whatever the operator
-            # has configured.
-            _critical_provider_keys: set[str] = set()
-            try:
-                from agent.proxy_sources import iron_proxy as _ip_for_mappings
-                _critical_provider_keys = set(
-                    _ip_for_mappings.family_env_names()
-                )
-            except Exception:  # noqa: BLE001 — best-effort collision check
-                pass
+            # Uses the SAME protected snapshot as the forward/extra-args
+            # guards (complete families plus the export fallback) instead of
+            # a second mappings read that a later failure could empty
+            # (S2-R1) — a name's presence here means ANY override is a
+            # collision because the egress path mints opaque tokens.
+            _critical_provider_keys = _egress_provider_names
             _critical = _critical_proxy_control | _critical_provider_keys
             _collisions = sorted(
                 k for k in _critical

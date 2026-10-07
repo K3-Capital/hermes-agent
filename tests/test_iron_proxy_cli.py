@@ -520,3 +520,64 @@ def test_cmd_start_fails_closed_when_family_values_conflict(
     assert "synthetic-conflict-B" not in out
     # No daemon state was published.
     assert not (state / "iron-proxy.pid").exists()
+
+
+# ---------------------------------------------------------------------------
+# S2-R4: Bitwarden alias-only provision through the real setup/start handlers
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_setup_then_start_resolves_bws_alias_only_provision(
+    hermes_home, monkeypatch, capsys,
+):
+    """Reviewed repro: a synthetic Bitwarden project that contains only
+    GROK_API_KEY.  Real cmd_setup persists the canonical XAI_API_KEY
+    mapping; real cmd_start must then clear the family-availability check
+    and reach the actual launch attempt instead of refusing on the missing
+    canonical key."""
+    from types import SimpleNamespace
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {}).update(
+        {"auto_install": False, "allow_env_fallback": False},
+    )
+    cfg.setdefault("secrets", {})["bitwarden"] = {
+        "enabled": True,
+        "project_id": "synthetic-project",
+        "access_token_env": "BWS_ACCESS_TOKEN",
+    }
+    save_config(cfg)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "bwsk-test-token")
+
+    _mock_setup_prereqs(monkeypatch, hermes_home)
+    monkeypatch.setattr(ip, "get_status", lambda: SimpleNamespace(pid=None))
+
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"GROK_API_KEY": "synthetic-one"}, []),
+    )
+
+    rc = proxy_cli.cmd_setup(_args(from_bitwarden=True))
+    assert rc == 0
+    persisted = {m.real_env_name for m in ip.load_mappings()}
+    assert "XAI_API_KEY" in persisted
+
+    # Start: the launch itself is a tripwire so no real daemon is spawned.
+    # The assertion is that start REACHES the launch attempt (bare refusal
+    # would stop before Popen), and that no synthetic value is printed.
+    launched = {"count": 0}
+
+    def tripwire(*args, **kwargs):
+        launched["count"] += 1
+        raise AssertionError("Unexpected proxy launch")
+
+    monkeypatch.setattr(ip.subprocess, "Popen", tripwire)
+    rc = proxy_cli.cmd_start(_args())
+    assert launched["count"] == 1, (
+        "start should have cleared the family-availability check and "
+        "reached the launch attempt"
+    )
+    out = capsys.readouterr().out
+    assert "synthetic-one" not in out

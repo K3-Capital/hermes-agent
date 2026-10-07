@@ -1325,3 +1325,120 @@ def test_family_env_names_reads_persisted_mappings(hermes_home):
     assert ip.family_env_names() == {"XAI_API_KEY", "GROK_API_KEY", "XAI_GROK_API_KEY"}
     assert ip.is_egress_mapped_credential("GROK_API_KEY") is True
     assert ip.is_egress_mapped_credential("TENOR_API_KEY") is False
+
+
+# ---------------------------------------------------------------------------
+# S2-R4: complete-family resolution from every supported source (host env,
+# refreshed Bitwarden values, caller overrides)
+# ---------------------------------------------------------------------------
+
+
+def _xai_alias_only_mapping():
+    return [_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))]
+
+
+def test_build_proxy_subprocess_env_host_alias_only_resolves_canonical(hermes_home, monkeypatch):
+    ip.write_mappings(_xai_alias_only_mapping())
+    monkeypatch.setenv("GROK_API_KEY", "synthetic-one")
+    env = ip._build_proxy_subprocess_env()
+    assert env.get("XAI_API_KEY") == "synthetic-one"
+
+
+def test_build_proxy_subprocess_env_bws_alias_only_resolves_canonical(hermes_home, monkeypatch):
+    """S2-R4 repro: a Bitwarden project provisioning ONLY the alias must
+    satisfy the family — setup already persisted the canonical mapping, and
+    start must not refuse on canonical-key membership alone."""
+    ip.write_mappings(_xai_alias_only_mapping())
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"GROK_API_KEY": "synthetic-one"}, []),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+
+    env = ip._build_proxy_subprocess_env(refresh_from_bitwarden=True, bitwarden_config=cfg)
+    assert env.get("XAI_API_KEY") == "synthetic-one"
+
+
+def test_build_proxy_subprocess_env_bws_empty_canonical_alias(hermes_home, monkeypatch):
+    """A whitespace-only canonical from Bitwarden must not shadow the
+    populated alias — the emitted canonical is non-empty."""
+    ip.write_mappings(_xai_alias_only_mapping())
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"XAI_API_KEY": " ", "GROK_API_KEY": "synthetic-one"}, []),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+
+    env = ip._build_proxy_subprocess_env(refresh_from_bitwarden=True, bitwarden_config=cfg)
+    assert env.get("XAI_API_KEY") == "synthetic-one"
+
+
+def test_build_proxy_subprocess_env_override_alias_only_resolves_canonical(hermes_home, monkeypatch):
+    """Caller-supplied alias-only overrides resolve onto the canonical
+    name the proxy config references."""
+    ip.write_mappings(_xai_alias_only_mapping())
+    env = ip._build_proxy_subprocess_env(extra_env={"GROK_API_KEY": "synthetic-one"})
+    assert env.get("XAI_API_KEY") == "synthetic-one"
+
+
+def test_build_proxy_subprocess_env_bws_alias_replaces_stale_host_same_name(hermes_home, monkeypatch):
+    """Rotation: a fresh Bitwarden value for the SAME name replaces the
+    stale host value by explicit precedence — the rotation is used and the
+    stale value is not."""
+    ip.write_mappings(_xai_alias_only_mapping())
+    monkeypatch.setenv("GROK_API_KEY", "synthetic-old")
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"GROK_API_KEY": "synthetic-one"}, []),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {
+        "project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN",
+        "allow_env_fallback": True,
+    }
+
+    env = ip._build_proxy_subprocess_env(refresh_from_bitwarden=True, bitwarden_config=cfg)
+    assert env.get("XAI_API_KEY") == "synthetic-one"
+
+    # And without the fallback flag the same rotation works too — the BWS
+    # value is what satisfies the family.
+    strict_cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+    env = ip._build_proxy_subprocess_env(refresh_from_bitwarden=True, bitwarden_config=strict_cfg)
+    assert env.get("XAI_API_KEY") == "synthetic-one"
+
+
+def test_build_proxy_subprocess_env_bws_strict_still_refuses_absent_family(hermes_home, monkeypatch):
+    """The rotation guarantee is unchanged: a family with no non-empty value
+    from Bitwarden (even with a stale HOST alias present) fails closed
+    without the documented fallback — no silent stale-host pickup."""
+    ip.write_mappings(_xai_alias_only_mapping())
+    monkeypatch.setenv("GROK_API_KEY", "synthetic-old")
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(bw, "fetch_bitwarden_secrets", lambda **kw: ({}, []))
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+
+    with pytest.raises(RuntimeError, match=r"did not return secrets.*XAI_API_KEY"):
+        ip._build_proxy_subprocess_env(refresh_from_bitwarden=True, bitwarden_config=cfg)
+
+
+def test_build_proxy_subprocess_env_override_satisfies_strict_bws_family(hermes_home, monkeypatch):
+    """An EXPLICIT caller override counts as a supported source: it satisfies
+    the family-availability check even in strict Bitwarden mode (it is not
+    the silent host-env fallback the strict mode forbids)."""
+    ip.write_mappings(_xai_alias_only_mapping())
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(bw, "fetch_bitwarden_secrets", lambda **kw: ({}, []))
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+
+    env = ip._build_proxy_subprocess_env(
+        refresh_from_bitwarden=True, bitwarden_config=cfg,
+        extra_env={"GROK_API_KEY": "synthetic-one"},
+    )
+    assert env.get("XAI_API_KEY") == "synthetic-one"

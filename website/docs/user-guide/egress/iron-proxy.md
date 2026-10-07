@@ -190,13 +190,17 @@ Aliased names (`GOOGLE_API_KEY`, `GROK_API_KEY`, `XAI_GROK_API_KEY`, `COINGECKO_
 
 An alias *family* must also carry ONE credential value: if two non-empty values disagree across a canonical name and its aliases (or across two aliases), `hermes egress setup` refuses to persist anything and `hermes egress start` / `restart` refuses to launch the proxy — names are reported, values never are. Empty and whitespace-only values count as absent. A half-finished rotation that leaves a stale alias behind stops loudly instead of silently selecting one of two keys.
 
+The family is also **resolved**, not just checked: the chosen non-empty value is emitted under the canonical name the proxy config references, whichever supported source supplied it. Host env, refreshed Bitwarden values and explicit caller overrides are considered in that precedence order, so a Bitwarden project that provisions only `GROK_API_KEY` still yields the canonical `XAI_API_KEY` secret, a whitespace canonical never shadows a populated alias, and a fresh Bitwarden value for one member replaces a stale host value of the same name. Being entirely absent from the selected source still fails closed in strict Bitwarden mode (`allow_env_fallback: false`).
+
 **Family protection is end to end, not just at container creation.** Every canonical/alias name is derived from the mappings you actually minted (never from naming suffixes), and that complete family:
 
-- refuses `docker_forward_env`, `docker_env` and `docker_extra_args` entries that name one of its members (sandbox creation fails before any container exists, under `enforce_on_docker: true`),
+- refuses `docker_forward_env`, `docker_env` and `docker_extra_args` entries that name one of its members — sandbox creation fails before any container exists, and the refusal uses the same authoritative snapshot the export produced, so a later unreadable or corrupt `mappings.json` cannot empty the guard,
 - is refused by skill/config env passthrough registration — a skill that declares e.g. `ARKHAM_API_KEY` or `TENDERLY_ACCESS_KEY` cannot tunnel the real host credential into a child process,
-- resolves to the OPAQUE proxy token on every path that could otherwise inject a host value (init, every later command, and after late skill registration).
+- resolves to the OPAQUE proxy token on every path that could otherwise inject a host value (init, every later command, and after late skill registration) — under `enforce_on_docker: true`.
 
-Unconfigured third-party credentials (`TENOR_API_KEY`, `NOTION_TOKEN`, …) are unaffected — they were never part of an egress family and keep passing through. With the proxy disabled there are no families and the pre-egress behavior is unchanged.
+The documented opt-out is unchanged: with `enforce_on_docker: false`, explicit `docker_env` values and inline `docker_extra_args` `-e NAME=value` flags still reach the container (warned, not refused). That is the operator's deliberate escape hatch — the enforced mode above is what refuses these collisions.
+
+Unconfigured third-party credentials (`TENOR_API_KEY`, `NOTION_TOKEN`, …) are unaffected — they were never part of an egress family and keep passing through. The family policy is scoped to the ACTIVE integration: with the proxy disabled (or not yet configured) there are no families and the pre-egress passthrough behavior is unchanged, even though `hermes egress disable` deliberately retains `mappings.json`.
 
 Every rule also carries a per-host method scope (e.g. `POST` for OpenRouter, `GET`/`HEAD`/`POST` for Etherscan, `GET`/`HEAD`/`POST`/`PUT`/`PATCH`/`DELETE` elsewhere). Requests outside the scope pass the proxy without substitution — that is what keeps public endpoints such as the OpenRouter model catalog working. `CONNECT` is never part of a method scope: the tunnel that opens each HTTPS connection must pass before the client can send the token.
 

@@ -2422,16 +2422,15 @@ def _build_proxy_subprocess_env(
 
     # The proxy reads the real upstream secrets from its OWN env, indexed
     # by ``m.real_env_name`` in the YAML config's ``secrets.source.var``
-    # field.  Forward those — but only those.  For alias providers
-    # (GEMINI_API_KEY / GOOGLE_API_KEY), the rule is keyed on the canonical
-    # name; when only an alias is set in the host env, mirror its value
-    # into the canonical name so the swap still has a real secret.
+    # field.  A provider's complete family (canonical name plus aliases)
+    # must resolve to ONE non-empty value and that value is emitted under
+    # the canonical name — for every supported source (host env, refreshed
+    # Bitwarden values, caller overrides).
     #
-    # D5: resolve each family through one shared value-validation path
-    # FIRST.  A family must carry one non-empty value — different
-    # canonical/alias (or alias/alias) values previously let the canonical
-    # win silently, which can select the wrong account after a rotation
-    # mismatch.  The error names variables only, never values.
+    # D5: conflicting values across a family fail closed.  An internally
+    # conflicting host environment is rejected FIRST, before the Bitwarden
+    # fetch below can make a network call.  The error names variables
+    # only, never values.
     mappings = load_mappings()
     parent_conflicts = find_family_value_conflicts(parent, mappings=mappings)
     if parent_conflicts:
@@ -2442,18 +2441,7 @@ def _build_proxy_subprocess_env(
         needed.add(m.real_env_name)
         if m.alias_env_names:
             alias_sources[m.real_env_name] = tuple(m.alias_env_names)
-    for name in needed:
-        # Empty/whitespace-only values count as absent; the first present
-        # non-empty value wins (canonical, then aliases in family order).
-        # Cross-member differences were already rejected above.
-        value: Optional[str] = None
-        for candidate_name in (name, *alias_sources.get(name, ())):
-            raw = parent.get(candidate_name)
-            if raw is not None and raw.strip():
-                value = raw
-                break
-        if value is not None:
-            env[name] = value
+    family_members = family_env_names(mappings)
 
     # Optional Bitwarden refresh path.  Pulled lazily so the proxy module
     # doesn't hard-depend on the bitwarden module being importable in
@@ -2475,13 +2463,30 @@ def _build_proxy_subprocess_env(
                     use_cache=False,
                 )
                 bws_values = dict(secrets)
-                # Only inject env names we have a mapping for — extra
-                # secrets in the BW project shouldn't leak into the proxy
-                # process unless they're going to be used by the swap.
-                missing = sorted(needed - set(secrets))
-                for n in needed:
-                    if n in secrets:
-                        env[n] = secrets[n]
+                # Only family members are ever injected — extra secrets in
+                # the BW project shouldn't leak into the proxy process
+                # unless they're going to be used by the swap.
+                #
+                # A family counts as SATISFIED by Bitwarden when ANY member
+                # (canonical name or alias) carries a non-empty value: a
+                # project that provisions only ``GROK_API_KEY`` legitimately
+                # satisfies the XAI family, and a whitespace canonical must
+                # not shadow a populated alias (S2-R4).  A family with no
+                # non-empty value from Bitwarden AND no explicit caller
+                # override still fails closed on this source unless the
+                # documented host-env fallback is enabled — an alias
+                # provision must not quietly degrade to stale host values.
+                missing = sorted(
+                    m.real_env_name for m in mappings
+                    if not any(
+                        (secrets.get(member) or "").strip()
+                        for member in (m.real_env_name, *(m.alias_env_names or ()))
+                    )
+                    and not any(
+                        ((extra_env or {}).get(member) or "").strip()
+                        for member in (m.real_env_name, *(m.alias_env_names or ()))
+                    )
+                )
                 if missing:
                     # stephenschoettler #1: don't silently keep stale
                     # host-env values when BWS mode was explicitly
@@ -2559,31 +2564,43 @@ def _build_proxy_subprocess_env(
                 exc,
             )
 
-    # Caller-supplied overrides win.  This is intentionally last so the
-    # wizard can inject ad-hoc test secrets without recomputing the BW
-    # path.
+    # S2-R4: gather the effective source view with explicit precedence —
+    # caller overrides > refreshed Bitwarden values > host environment —
+    # then validate and resolve each COMPLETE family once.  Conflicts in
+    # the effective view fail closed (one check covering parent/BWS/caller
+    # mixes); the chosen non-empty value is emitted under the canonical
+    # name the proxy config references.
+    view: Dict[str, str] = {}
+    for name in family_members:
+        if name in parent:
+            view[name] = parent[name]
+    for name in family_members:
+        if name in bws_values:
+            view[name] = bws_values[name]
     if extra_env:
-        env.update(extra_env)
-
-    # D5, final pass: Bitwarden refresh and caller overrides can each be
-    # internally consistent while disagreeing with another source for the
-    # same family (e.g. freshly rotated canonical in BWS vs a stale alias
-    # still in the host env).  Validate the EFFECTIVE view — what the
-    # proxy will actually receive — with values from the merged env first,
-    # then the Bitwarden fetch, then the parent env standing in for any
-    # family member none of those restated.
-    effective_view: Dict[str, str] = {}
-    for m in mappings:
-        for name in (m.real_env_name, *(m.alias_env_names or ())):
-            if name in env:
-                effective_view[name] = env[name]
-            elif name in bws_values:
-                effective_view[name] = bws_values[name]
-            elif name in parent:
-                effective_view[name] = parent[name]
-    merged_conflicts = find_family_value_conflicts(effective_view, mappings=mappings)
+        for name in family_members:
+            if name in extra_env:
+                view[name] = extra_env[name]
+    merged_conflicts = find_family_value_conflicts(view, mappings=mappings)
     if merged_conflicts:
         raise _family_conflicts_error(merged_conflicts)
+    for name in needed:
+        # Empty/whitespace-only values count as absent; the first present
+        # non-empty value wins (canonical, then aliases in family order).
+        value: Optional[str] = None
+        for candidate_name in (name, *alias_sources.get(name, ())):
+            raw = view.get(candidate_name)
+            if raw is not None and raw.strip():
+                value = raw
+                break
+        if value is not None:
+            env[name] = value
+
+    # Caller-supplied overrides for every other name win too.  This is
+    # intentionally last so the wizard can inject ad-hoc test secrets
+    # without recomputing the BW path.
+    if extra_env:
+        env.update(extra_env)
 
     # Strip proxy-recursion-risk vars regardless of how they got in.
     for name in _PROXY_SUBPROCESS_ENV_STRIP:

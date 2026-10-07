@@ -47,10 +47,30 @@ def _get_allowed() -> set[str]:
 _config_passthrough: frozenset[str] | None = None
 
 
+def _egress_family_policy_active() -> bool:
+    """True while the native iron-proxy integration is enabled (S2-R3).
+
+    The mapping-family policy is an *integration* policy, so it applies only
+    while the integration is switched on.  ``hermes egress disable`` flips
+    ``proxy.enabled`` but deliberately retains ``mappings.json``; if mere
+    presence of mappings kept refusing names, disabling the optional egress
+    feature would permanently change the pre-egress passthrough behavior for
+    previously mapped third-party credentials.  Fail-safe: an unreadable
+    config reads as "not active".
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config() or {}
+        return bool((cfg.get("proxy") or {}).get("enabled"))
+    except Exception:
+        return False
+
+
 def _is_hermes_provider_credential(name: str) -> bool:
     """True if ``name`` is a Hermes-managed provider credential (API key,
-    token, or similar) per ``_HERMES_PROVIDER_ENV_BLOCKLIST`` or an
-    egress-mapping family.
+    token, or similar) per ``_HERMES_PROVIDER_ENV_BLOCKLIST`` or, while the
+    egress integration is enabled, an egress-mapping family.
 
     Skill-declared ``required_environment_variables`` frontmatter must
     not be able to override this list — that was the bypass in
@@ -60,14 +80,15 @@ def _is_hermes_provider_credential(name: str) -> bool:
     sandbox's scrubbing guarantee.
 
     Egress-mapping families (``agent.proxy_sources.iron_proxy``) are
-    protected for the same reason: under enforced egress the sandbox
-    receives only opaque proxy tokens, and a skill registering e.g.
-    ``ARKHAM_API_KEY`` or ``TENDERLY_ACCESS_KEY`` must not tunnel the
+    protected for the same reason while the integration is active: the
+    sandbox receives only opaque proxy tokens, and a skill registering
+    e.g. ``ARKHAM_API_KEY`` or ``TENDERLY_ACCESS_KEY`` must not tunnel the
     real host credential into a child process.  The family set derives
     from the operator's own mappings (canonical name + complete alias
-    family — never naming suffixes or a stale list), so unconfigured
-    third-party credentials (TENOR_API_KEY, NOTION_TOKEN, ...) remain
-    legitimately registerable.
+    family — never naming suffixes or a stale list) and is scoped to the
+    ACTIVE integration, so unconfigured third-party credentials
+    (TENOR_API_KEY, NOTION_TOKEN, ...) remain registerable and a disabled
+    proxy restores the previous forwarding behavior (S2-R3).
 
     Fail closed: if the authoritative blocklist cannot be imported (partial
     install, import-time error, etc.) we treat the name as a protected
@@ -96,7 +117,10 @@ def _is_hermes_provider_credential(name: str) -> bool:
         return True
     if name in _HERMES_PROVIDER_ENV_BLOCKLIST:
         return True
-    # Egress-mapping families: canonical name plus every alias (S2-R1).
+    # Egress-mapping families: canonical name plus every alias, and only
+    # while the integration is enabled (S2-R1 / S2-R3).
+    if not _egress_family_policy_active():
+        return False
     try:
         from agent.proxy_sources.iron_proxy import is_egress_mapped_credential
 
