@@ -1442,3 +1442,106 @@ def test_build_proxy_subprocess_env_override_satisfies_strict_bws_family(hermes_
         extra_env={"GROK_API_KEY": "synthetic-one"},
     )
     assert env.get("XAI_API_KEY") == "synthetic-one"
+
+
+# ---------------------------------------------------------------------------
+# S2-R4 output normalization: a blank/whitespace caller canonical must not
+# overwrite the family value resolved from a populated alias — asserted on
+# the FINAL returned environment and at the real launch boundary
+# ---------------------------------------------------------------------------
+
+_FINAL_VALUE = "synthetic-review-value"
+
+
+def _build_final_env(monkeypatch, source: str, overrides):
+    """Mirror of the reviewed output-boundary fixture: one populated alias
+    source (host / Bitwarden / caller), optional caller overrides."""
+    import agent.secret_sources.bitwarden as bw
+
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets",
+        lambda **kw: ({"GROK_API_KEY": _FINAL_VALUE} if source == "bws" else {}, []),
+    )
+    if source == "host":
+        monkeypatch.setenv("GROK_API_KEY", _FINAL_VALUE)
+    caller = {"GROK_API_KEY": _FINAL_VALUE} if source == "override" else {}
+    caller.update(overrides)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+    return ip._build_proxy_subprocess_env(
+        extra_env=caller,
+        refresh_from_bitwarden=(source == "bws"),
+        bitwarden_config=cfg,
+    )
+
+
+@pytest.mark.parametrize("blank", ["", " \t"])
+@pytest.mark.parametrize("source", ["host", "bws", "override"])
+def test_blank_caller_canonical_keeps_resolved_family_value(
+    hermes_home, monkeypatch, source, blank,
+):
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    env = _build_final_env(monkeypatch, source, {"XAI_API_KEY": blank})
+    assert env.get("XAI_API_KEY") == _FINAL_VALUE
+    assert (env.get("XAI_API_KEY") or "").strip(), "canonical must be non-empty"
+    assert env.get("XAI_API_KEY") != blank
+
+
+@pytest.mark.parametrize("source", ["host", "bws", "override"])
+def test_alias_only_final_env_controls(hermes_home, monkeypatch, source):
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    env = _build_final_env(monkeypatch, source, {})
+    assert env.get("XAI_API_KEY") == _FINAL_VALUE
+
+
+def test_non_family_caller_override_preserved_with_family_resolution(
+    hermes_home, monkeypatch,
+):
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    env = _build_final_env(
+        monkeypatch, "override", {"REVIEW_NON_FAMILY_SETTING": "synthetic-setting"},
+    )
+    assert env.get("XAI_API_KEY") == _FINAL_VALUE
+    assert env.get("REVIEW_NON_FAMILY_SETTING") == "synthetic-setting"
+
+
+def test_start_proxy_launch_env_resolves_blank_caller_canonical(
+    hermes_home, monkeypatch,
+):
+    """Launch boundary: real start_proxy with extra_env carrying a blank
+    canonical plus a populated alias must hand the child an env whose
+    canonical is the resolved value.  Popen is intercepted — no process is
+    launched."""
+    import yaml
+
+    ip.write_mappings([_family_mapping("XAI_API_KEY", ("GROK_API_KEY",))])
+    state = ip._proxy_state_dir()
+    config_path = state / "caller-start.yaml"
+    config_path.write_text(
+        yaml.safe_dump(ip.build_proxy_config(
+            mappings=ip.load_mappings(),
+            ca_cert=state / "synthetic-ca.crt",
+            ca_key=state / "synthetic-ca.key",
+            http_listen=["127.0.0.1:18080"],
+        )),
+        encoding="utf-8",
+    )
+    captured: dict = {}
+
+    class _LaunchTripwire(Exception):
+        pass
+
+    def tripwire(*args, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        raise _LaunchTripwire()
+
+    monkeypatch.setattr(ip.subprocess, "Popen", tripwire)
+
+    with pytest.raises(_LaunchTripwire):
+        ip.start_proxy(
+            binary=state / "synthetic-no-binary",
+            config_path=config_path,
+            install_if_missing=False,
+            extra_env={"XAI_API_KEY": " ", "GROK_API_KEY": _FINAL_VALUE},
+        )
+    assert captured.get("XAI_API_KEY") == _FINAL_VALUE

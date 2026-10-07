@@ -2596,11 +2596,18 @@ def _build_proxy_subprocess_env(
         if value is not None:
             env[name] = value
 
-    # Caller-supplied overrides for every other name win too.  This is
+    # Caller-supplied overrides for NON-family names win too.  This is
     # intentionally last so the wizard can inject ad-hoc test secrets
-    # without recomputing the BW path.
+    # without recomputing the BW path.  Family members are deliberately
+    # excluded: their canonical values were resolved above from the
+    # effective view, and re-applying a caller entry here would let a
+    # blank/whitespace canonical overwrite the resolved output
+    # (S2-R4 output normalization).
     if extra_env:
-        env.update(extra_env)
+        env.update(
+            (name, value) for name, value in extra_env.items()
+            if name not in family_members
+        )
 
     # Strip proxy-recursion-risk vars regardless of how they got in.
     for name in _PROXY_SUBPROCESS_ENV_STRIP:
