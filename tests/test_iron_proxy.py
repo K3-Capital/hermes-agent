@@ -13,7 +13,9 @@ smoke test.
 
 from __future__ import annotations
 
+import fnmatch
 import io
+import json
 import os
 import sys
 import tarfile
@@ -812,5 +814,356 @@ def test_bitwarden_importerror_raise_without_fallback(
         ip._build_proxy_subprocess_env(
             refresh_from_bitwarden=True, bitwarden_config=bw_cfg,
         )
+
+
+# ---------------------------------------------------------------------------
+# Required data-provider scopes, per-host method/query scoping, durable
+# mappings and the public-host policy (stage-2 native egress work)
+# ---------------------------------------------------------------------------
+
+# Frozen stage-1 contract for the required data providers: canonical env
+# name plus aliases, exact hosts, exact credential location(s) and the
+# per-host method scope.  Mirrors the reviewed credential inventory; the
+# disabled Solodit entry is deliberately absent.
+_REQUIRED_SCOPES = {
+    "XAI_API_KEY": dict(
+        aliases=("GROK_API_KEY", "XAI_GROK_API_KEY"),
+        hosts=("api.x.ai",),
+        match_headers=("Authorization",),
+        methods=("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        match_query=False,
+    ),
+    "ARKHAM_API_KEY": dict(
+        aliases=(),
+        hosts=("api.arkm.com",),
+        match_headers=("API-Key",),
+        methods=("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        match_query=False,
+    ),
+    "ETHERSCAN_API_KEY": dict(
+        aliases=(),
+        hosts=(
+            "api.etherscan.io",
+            "api.basescan.org",
+            "api.arbiscan.io",
+            "api-optimistic.etherscan.io",
+        ),
+        match_headers=(),
+        methods=("GET", "HEAD", "POST"),
+        match_query=True,
+    ),
+    "COINGECKO_DEMO_API_KEY": dict(
+        aliases=("COINGECKO_API_KEY",),
+        hosts=("api.coingecko.com",),
+        match_headers=("x-cg-demo-api-key",),
+        methods=("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        match_query=False,
+    ),
+    "FIRECRAWL_API_KEY": dict(
+        aliases=(),
+        hosts=("api.firecrawl.dev",),
+        match_headers=("Authorization",),
+        methods=("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        match_query=False,
+    ),
+    "TENDERLY_ACCESS_TOKEN": dict(
+        aliases=("TENDERLY_ACCESS_KEY", "TENDERLY_API_KEY"),
+        hosts=("api.tenderly.co",),
+        match_headers=("X-Access-Key",),
+        methods=("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        match_query=False,
+    ),
+    "OPENROUTER_API_KEY": dict(
+        aliases=(),
+        hosts=("openrouter.ai", "*.openrouter.ai"),
+        match_headers=("Authorization",),
+        methods=("POST",),
+        match_query=False,
+    ),
+}
+
+
+def _secret_rules(config):
+    return [
+        secret
+        for transform in config["transforms"]
+        if transform["name"] == "secrets"
+        for secret in transform["config"]["secrets"]
+    ]
+
+
+def _glob_matches(host: str, pattern: str) -> bool:
+    """Mirror iron-proxy's documented host-glob semantics for assertions.
+
+    ``*`` matches any host; ``*.example.com`` matches ``example.com`` and
+    every subdomain depth; anything else is a path-style glob (hostnames
+    contain no ``/``, so fnmatch is exact here).
+    """
+    if pattern == "*":
+        return True
+    if pattern.startswith("*."):
+        suffix = pattern[1:]
+        return host.endswith(suffix) or host == pattern[2:]
+    return fnmatch.fnmatchcase(host, pattern)
+
+
+def test_required_data_providers_discovered_with_exact_scope():
+    """Every required data provider is a first-class registry entry with the
+    frozen canonical name, aliases, hosts, credential locations and the
+    per-host method scope."""
+
+    names = list(_REQUIRED_SCOPES)
+    discovered = ip.discover_provider_mappings(available_env_names=names)
+    by_name = {m.real_env_name: m for m in discovered}
+    assert set(by_name) == set(names)
+    for name, scope in _REQUIRED_SCOPES.items():
+        m = by_name[name]
+        assert set(m.alias_env_names) == set(scope["aliases"]), name
+        assert set(m.upstream_hosts) == set(scope["hosts"]), name
+        assert tuple(m.methods) == scope["methods"], name
+        assert set(h.lower() for h in m.match_headers) == set(
+            h.lower() for h in scope["match_headers"]
+        ), name
+        assert m.match_query is scope["match_query"], name
+
+
+def test_alias_only_discovery_collapses_to_canonical():
+    """An alias in the host env alone mints ONE mapping under the canonical
+    name (two require-rules on the same host would reject each other)."""
+
+    for name, scope in _REQUIRED_SCOPES.items():
+        for alias in scope["aliases"]:
+            got = ip.discover_provider_mappings(available_env_names=[alias])
+            assert len(got) == 1, alias
+            assert got[0].real_env_name == name, alias
+
+
+def test_coingecko_pro_credential_not_discovered():
+    """Demo-only: a Pro env name must never mint a mapping or collapse into
+    the Demo family."""
+
+    assert ip.discover_provider_mappings(
+        available_env_names=["COINGECKO_PRO_API_KEY"]
+    ) == []
+
+
+def test_generated_rules_carry_exact_scopes(tmp_path):
+    """Generated secrets rules keep the exact host/header/query/method scope
+    (including an intentionally empty header list for query-only auth)."""
+
+    names = list(_REQUIRED_SCOPES)
+    discovered = ip.discover_provider_mappings(available_env_names=names)
+    config = ip.build_proxy_config(
+        mappings=discovered,
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+    )
+    rules = _secret_rules(config)
+    by_name = {r["source"]["var"]: r for r in rules}
+    assert set(by_name) == set(names)
+    for name, scope in _REQUIRED_SCOPES.items():
+        rule = by_name[name]
+        replace = rule["replace"]
+        assert set(h.lower() for h in replace["match_headers"]) == set(
+            h.lower() for h in scope["match_headers"]
+        ), name
+        assert replace["match_query"] is scope["match_query"], name
+        assert replace["require"] is True, name
+        hosts = [entry["host"] for entry in rule["rules"]]
+        assert len(hosts) == len(set(hosts)), name
+        assert set(hosts) == set(scope["hosts"]), name
+        for entry in rule["rules"]:
+            assert tuple(entry["methods"]) == scope["methods"], name
+
+
+def test_generated_rules_never_match_connect():
+    """Every generated rule is method-scoped and excludes CONNECT: the
+    proxy runs the transform pipeline on the synthetic CONNECT request that
+    opens each HTTPS tunnel, where no proxy token can be present yet — a
+    method-less require rule would reject the tunnel itself."""
+
+    discovered = ip.discover_provider_mappings(
+        available_env_names=list(ip._BEARER_PROVIDERS)
+        + list(ip._HEADER_AUTH_PROVIDERS)
+    )
+    config = ip.build_proxy_config(
+        mappings=discovered + [
+            # explicit-method mapping keeps its own (CONNECT-free) scope
+            ip.TokenMapping(
+                proxy_token=ip.mint_proxy_token("custom"),
+                real_env_name="CUSTOM_QUERY_KEY",
+                upstream_hosts=("custom.example",),
+                match_headers=(),
+                methods=("POST",),
+                match_query=True,
+            ),
+        ],
+        ca_cert=Path("/fixture/ca.crt"),
+        ca_key=Path("/fixture/ca.key"),
+    )
+    for rule in _secret_rules(config):
+        for entry in rule["rules"]:
+            methods = entry.get("methods")
+            assert methods, rule["source"]["var"]
+            assert "CONNECT" not in methods, rule["source"]["var"]
+
+
+def test_cli_subscription_oauth_hosts_never_swapped(tmp_path):
+    """Codex/CLI subscription OAuth endpoints pass through unchanged; no
+    generated rule matches auth.openai.com / chatgpt.com for any of the
+    built-in providers (their keys must never be substituted there)."""
+
+    discovered = ip.discover_provider_mappings(
+        available_env_names=list(ip._BEARER_PROVIDERS)
+        + list(ip._HEADER_AUTH_PROVIDERS)
+    )
+    config = ip.build_proxy_config(
+        mappings=discovered,
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+    )
+    oauth_hosts = ("auth.openai.com", "chatgpt.com", "api.chatgpt.com")
+    for rule in _secret_rules(config):
+        for entry in rule["rules"]:
+            for host in oauth_hosts:
+                assert not _glob_matches(host, entry["host"]), (
+                    f"{rule['source']['var']} would swap on {host}"
+                )
+
+
+def test_mappings_roundtrip_preserves_scope_fields(hermes_home):
+    """write_mappings/load_mappings round-trips method scope, per-mapping
+    query matching and an explicitly empty header list."""
+
+    mappings = ip.discover_provider_mappings(
+        available_env_names=list(_REQUIRED_SCOPES)
+    )
+    ip.write_mappings(mappings)
+    assert ip.load_mappings() == mappings
+
+
+def test_legacy_mappings_file_loads_with_bearer_defaults(hermes_home):
+    """mappings.json written before the scope fields existed still loads:
+    Authorization header, no explicit method scope, query matching on."""
+
+    import json as _json
+
+    state = ip._proxy_state_dir()
+    (state / "mappings.json").write_text(_json.dumps({
+        "version": 1,
+        "tokens": [{
+            "proxy_token": "hermes-proxy-legacy",
+            "env_name": "OPENAI_API_KEY",
+            "upstream_hosts": ["api.openai.com"],
+        }],
+    }))
+    loaded = ip.load_mappings()
+    assert len(loaded) == 1
+    assert loaded[0].match_headers == ("Authorization",)
+    assert loaded[0].methods == ()
+    assert loaded[0].match_query is True
+
+
+def test_merge_refreshes_scope_and_preserves_tokens():
+    """Rediscovery keeps minted tokens but refreshes changed scopes; rotation
+    still mints fresh tokens."""
+
+    existing = [ip.TokenMapping(
+        proxy_token="hermes-proxy-old",
+        real_env_name="ARKHAM_API_KEY",
+        upstream_hosts=("api.arkm.com",),
+        match_headers=("Authorization",),
+        methods=(),
+        match_query=True,
+    )]
+    discovered = ip.discover_provider_mappings(available_env_names=["ARKHAM_API_KEY"])
+    merged = ip.merge_mappings(existing=existing, discovered=discovered)
+    assert merged[0].proxy_token == "hermes-proxy-old"
+    assert tuple(merged[0].match_headers) == ("API-Key",)
+    assert tuple(merged[0].methods) == _REQUIRED_SCOPES["ARKHAM_API_KEY"]["methods"]
+    assert merged[0].match_query is False
+    rotated = ip.merge_mappings(existing=existing, discovered=discovered, rotate=True)
+    assert rotated[0].proxy_token != "hermes-proxy-old"
+
+
+def test_public_host_policy_flag(tmp_path):
+    """allow_public_hosts=True makes the generated allowlist permissive for
+    general public traffic while the SSRF deny list and host-scoped secrets
+    stay intact; the default keeps the strict list."""
+
+    mapping = _sample_mapping("OPENAI_API_KEY")
+    strict = ip.build_proxy_config(
+        mappings=[mapping], ca_cert=tmp_path / "ca.crt", ca_key=tmp_path / "ca.key",
+    )
+    public = ip.build_proxy_config(
+        mappings=[mapping], ca_cert=tmp_path / "ca.crt", ca_key=tmp_path / "ca.key",
+        allow_public_hosts=True,
+    )
+    strict_domains = strict["transforms"][0]["config"]["domains"]
+    public_domains = public["transforms"][0]["config"]["domains"]
+    assert "*" not in strict_domains
+    assert "*" in public_domains
+    # SSRF defaults survive the permissive allowlist.
+    assert strict["proxy"]["upstream_deny_cidrs"] == public["proxy"]["upstream_deny_cidrs"]
+    assert "169.254.0.0/16" in public["proxy"]["upstream_deny_cidrs"]
+    # Secrets stay host-scoped under the public policy.
+    rule = next(
+        r for r in _secret_rules(public)
+        if r["source"]["var"] == "OPENAI_API_KEY"
+    )
+    assert [entry["host"] for entry in rule["rules"]] == list(mapping.upstream_hosts)
+    assert "*" not in [entry["host"] for entry in rule["rules"]]
+
+
+def test_registry_conflict_detection():
+    """Conflicting host/header scope for the same env name (canonical or
+    alias) fails closed; the production registry is conflict-free."""
+
+    assert ip.find_registry_conflicts() == []
+    conflicting = {
+        "ALPHA_API_KEY": {"hosts": ("api.alpha.example",), "match_headers": ("Authorization",), "aliases": ()},
+        "BETA_API_KEY": {"hosts": ("api.alpha.example",), "match_headers": ("Authorization",), "aliases": ("ALPHA_API_KEY",)},
+    }
+    conflicts = ip.find_registry_conflicts(conflicting)
+    assert conflicts, "same env name with a different provider must be reported"
+
+
+def test_missing_required_mapping_refuses_before_container_creation(hermes_home, monkeypatch):
+    """With proxy.required_env_names configured, a sandbox is refused when a
+    required provider has no minted mapping — the failure lands before any
+    container is created (enforce_on_docker), not inside the sandbox."""
+
+    from tools.environments.docker import _egress_proxy_args_for_docker
+    from hermes_cli.config import load_config, save_config
+
+    state = ip._proxy_state_dir()
+    (state / "ca.crt").write_text("fake-ca")
+    (state / "ca.key").write_text("fake-key")
+    mapping = _sample_mapping("OPENROUTER_API_KEY")
+    proxy_cfg = ip.build_proxy_config(
+        mappings=[mapping], ca_cert=state / "ca.crt", ca_key=state / "ca.key",
+    )
+    ip.write_proxy_config(proxy_cfg)
+    ip.write_mappings([mapping])
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["enforce_on_docker"] = True
+    cfg["proxy"]["required_env_names"] = ["OPENROUTER_API_KEY", "ARKHAM_API_KEY"]
+    save_config(cfg)
+
+    (state / "iron-proxy.pid").write_text("99999")
+    monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(ip, "_port_listening", lambda h, p: True)
+
+    with pytest.raises(RuntimeError, match="ARKHAM_API_KEY"):
+        _egress_proxy_args_for_docker()
+
+    # Satisfying the requirement makes the same state start cleanly.
+    cfg = load_config()
+    cfg["proxy"]["required_env_names"] = ["OPENROUTER_API_KEY"]
+    save_config(cfg)
+    volume_args, env, host_args = _egress_proxy_args_for_docker()
+    assert env.get("OPENROUTER_API_KEY") == mapping.proxy_token
 
 

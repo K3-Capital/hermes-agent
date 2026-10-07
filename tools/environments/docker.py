@@ -519,6 +519,32 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
         logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
         return ([], {}, [])
 
+    # A PARTIAL mappings.json is just as broken as an empty one when the
+    # deployment declares required providers: traffic for the missing
+    # provider would 403 inside the sandbox with no useful clue.  Fail
+    # BEFORE container creation instead.  `proxy.required_env_names` is
+    # empty by default (no requirement).
+    required_names = [
+        name for name in (proxy_cfg.get("required_env_names") or []) if name
+    ]
+    if required_names:
+        present_names: set[str] = set()
+        for m in mappings:
+            present_names.add(m.real_env_name)
+            present_names.update(getattr(m, "alias_env_names", ()) or ())
+        missing = [name for name in required_names if name not in present_names]
+        if missing:
+            msg = (
+                "iron-proxy is missing required provider mapping(s): "
+                f"{', '.join(missing)}.  Re-run `hermes egress setup` with "
+                "those keys present in env/Bitwarden, or adjust "
+                "`proxy.required_env_names`."
+            )
+            if enforce:
+                raise RuntimeError(msg)
+            logger.warning("%s — continuing without proxy (enforce_on_docker=false).", msg)
+            return ([], {}, [])
+
     container_ca = "/etc/ssl/certs/hermes-egress-ca.crt"
     volume_args = ["-v", f"{status.ca_cert_path}:{container_ca}:ro"]
 

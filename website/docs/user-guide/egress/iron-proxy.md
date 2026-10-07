@@ -101,6 +101,20 @@ proxy:
   # OpenAI, Anthropic, Google, xAI, Mistral, Groq, Together, DeepSeek,
   # and Nous Research.
   extra_allowed_hosts: []
+
+  # Public-browsing policy.  false (default) keeps the strict allowlist
+  # (bundled inference hosts + provider hosts + extra_allowed_hosts).
+  # true additionally allows arbitrary public hosts, for deployments
+  # where agents do general web research and package installs.  The SSRF
+  # deny CIDRs and the host-scoped secrets rules are unchanged —
+  # credentials are never substituted outside their inventoried hosts.
+  allow_public_hosts: false
+
+  # Providers that MUST have a minted mapping (canonical name or any
+  # alias).  A missing entry refuses Docker sandbox creation
+  # (enforce_on_docker semantics) instead of shipping a sandbox whose
+  # egress will 403; `hermes egress setup` warns with the missing names.
+  required_env_names: []
 ```
 
 ### Default allowed upstream hosts
@@ -115,6 +129,15 @@ api.deepseek.com        inference.nousresearch.com
 ```
 
 If your agent needs an upstream that isn't on the list — a self-hosted inference endpoint, an extra cloud LLM, an MCP server — add it to `proxy.extra_allowed_hosts`. Wildcards are matched against the full hostname (`*.example.com` matches `api.example.com` and `staging.example.com` but not `example.com` itself).
+
+### Public browsing and the public-host policy
+
+Sandboxes are not limited to inference hosts. Two knobs:
+
+- `proxy.extra_allowed_hosts: [...]` — allow specific additional hosts (wildcards supported).
+- `proxy.allow_public_hosts: true` — allow any public host, for deployments where agents do general web research and package installs. The SSRF deny CIDRs (see below) and the host-scoped `secrets` rules are unchanged: credentials are only ever substituted on their inventoried hosts, and the per-host method/query scopes still apply.
+
+HTTPS traffic reaches the proxy as a CONNECT tunnel; the allowlist is checked against the tunnel target, and credential substitution happens on the decrypted request inside the tunnel. Generated `secrets` rules are method-scoped and deliberately never include `CONNECT`, so a required-credential rule can never reject the tunnel that carries its own request.
 
 ### Default SSRF deny CIDRs
 
@@ -151,10 +174,21 @@ The `secrets` transform swaps the proxy token wherever it appears in a matched l
 
 | Provider | Env var | Swapped in |
 |---|---|---|
-| OpenRouter, OpenAI, Groq, Together, DeepSeek, Mistral, xAI, Nous | `*_API_KEY` | `Authorization` header |
+| OpenAI, Groq, Together, DeepSeek, Mistral, Nous | `*_API_KEY` | `Authorization` header |
+| OpenRouter | `OPENROUTER_API_KEY` | `Authorization` header — `POST` only, so the public model-catalog `GET` stays unauthenticated |
+| xAI / Grok | `XAI_API_KEY` / `GROK_API_KEY` / `XAI_GROK_API_KEY` | `Authorization` header |
 | Anthropic native | `ANTHROPIC_API_KEY` | `x-api-key` + `Authorization` |
 | Azure OpenAI | `AZURE_OPENAI_API_KEY` | `api-key` + `Authorization` (`*.openai.azure.com`, `*.cognitiveservices.azure.com`, `*.services.ai.azure.com`) |
 | Google AI Studio (Gemini) | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `x-goog-api-key` header or `?key=` query param |
+| Etherscan-compatible explorers | `ETHERSCAN_API_KEY` | `apikey` query parameter (`api.etherscan.io`, `api.basescan.org`, `api.arbiscan.io`, `api-optimistic.etherscan.io`; `GET`/`HEAD`/`POST`) |
+| CoinGecko Demo | `COINGECKO_DEMO_API_KEY` / `COINGECKO_API_KEY` | `x-cg-demo-api-key` header on `api.coingecko.com` (Demo tier only — the Pro host/header are not part of this provider) |
+| Firecrawl | `FIRECRAWL_API_KEY` | `Authorization` header |
+| Tenderly | `TENDERLY_ACCESS_TOKEN` / `TENDERLY_ACCESS_KEY` / `TENDERLY_API_KEY` | `X-Access-Key` header |
+| Arkham | `ARKHAM_API_KEY` | `API-Key` header |
+
+Aliased names (`GOOGLE_API_KEY`, `GROK_API_KEY`, `XAI_GROK_API_KEY`, `COINGECKO_API_KEY`, `TENDERLY_ACCESS_KEY`, `TENDERLY_API_KEY`) are the SAME upstream credential as their canonical name: one proxy token is minted and injected under every name, and any of them in your host env satisfies discovery. The same env name is never owned by two providers — a conflicting registry fails `hermes egress setup` closed.
+
+Every rule also carries a per-host method scope (e.g. `POST` for OpenRouter, `GET`/`HEAD`/`POST` for Etherscan, `GET`/`HEAD`/`POST`/`PUT`/`PATCH`/`DELETE` elsewhere). Requests outside the scope pass the proxy without substitution — that is what keeps public endpoints such as the OpenRouter model catalog working. `CONNECT` is never part of a method scope: the tunnel that opens each HTTPS connection must pass before the client can send the token.
 
 `GEMINI_API_KEY` and `GOOGLE_API_KEY` are treated as one credential: a single proxy token is minted and injected into the sandbox under **both** names, and either name in your host env satisfies discovery.
 

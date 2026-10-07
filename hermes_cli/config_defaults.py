@@ -3997,6 +3997,21 @@ DEFAULT_CONFIG = {
         # cover OpenRouter, OpenAI, Anthropic, Google, xAI, Mistral, Groq,
         # Together, DeepSeek, Nous).  Wildcards (`*.foo.com`) are supported.
         "extra_allowed_hosts": [],
+        # Public-browsing policy.  false (default) keeps the strict
+        # allowlist: bundled inference hosts + provider hosts +
+        # extra_allowed_hosts.  true additionally emits the literal ``*``
+        # allowlist domain so general research/package traffic reaches
+        # arbitrary public hosts.  The SSRF deny CIDRs
+        # (proxy.upstream_deny_cidrs) and the host-scoped secrets rules
+        # still apply — credentials are never substituted outside their
+        # inventoried hosts.
+        "allow_public_hosts": False,
+        # Env names that MUST have a minted mapping (canonical name or any
+        # alias).  When one is missing, the Docker backend refuses to
+        # create a sandbox (enforce_on_docker semantics) instead of
+        # shipping one whose egress will 403, and `hermes egress setup`
+        # warns with the missing names.  Empty = no requirement.
+        "required_env_names": [],
     },
 
     # Hermes Desktop (Electron app) launch options. These only affect

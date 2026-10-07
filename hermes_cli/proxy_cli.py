@@ -187,6 +187,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
     console.print()
     console.print("[bold]Step 3[/bold]  Mint proxy tokens for known providers")
 
+    # Fail closed on a broken provider registry before minting anything: a
+    # name claimed by two entries would emit mutually-rejecting require
+    # rules, and a mis-owned alias could swap the wrong secret.
+    registry_conflicts = ip.find_registry_conflicts()
+    if registry_conflicts:
+        console.print(
+            "  [red]✗ provider registry conflicts (fail closed):[/red] "
+            + "; ".join(registry_conflicts)
+        )
+        return 1
+
     available_env_names: List[str] = []
     if args.from_bitwarden:
         cfg = load_config()
@@ -324,9 +335,38 @@ def cmd_setup(args: argparse.Namespace) -> int:
         console.print(
             "  Set at least one of these and rerun setup:"
         )
-        for env_name in sorted(ip._BEARER_PROVIDERS):
+        for env_name in sorted(
+            set(ip._BEARER_PROVIDERS) | set(ip._HEADER_AUTH_PROVIDERS)
+        ):
             console.print(f"    - {env_name}")
         return 1
+
+    # Required-mapping policy: surface providers the deployment declares
+    # mandatory but that have no mapping yet.  Docker sandbox creation
+    # refuses (enforce_on_docker) until this is resolved — see
+    # _egress_proxy_args_for_docker.
+    required_env_names = [
+        name
+        for name in (load_config().get("proxy") or {}).get("required_env_names") or []
+        if name
+    ]
+    if required_env_names:
+        mapped_names = set()
+        for m in mappings:
+            mapped_names.add(m.real_env_name)
+            mapped_names.update(m.alias_env_names)
+        missing_required = [n for n in required_env_names if n not in mapped_names]
+        if missing_required:
+            console.print()
+            console.print(
+                "  [yellow]⚠ proxy.required_env_names lists providers "
+                f"without a mapping: {', '.join(missing_required)}[/yellow]"
+            )
+            console.print(
+                "  [dim]Docker sandbox creation will refuse until those "
+                "keys are present in env/Bitwarden (then re-run setup), or "
+                "the list is adjusted in config.yaml.[/dim]"
+            )
 
     # Warn the operator about providers we recognize but can't proxy
     # (AWS Bedrock SigV4, GCP Vertex service-account OAuth).  These still
@@ -384,6 +424,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
     proxy_cfg["tunnel_port"] = tunnel_port
 
     extra_hosts = list(proxy_cfg.get("extra_allowed_hosts") or [])
+    bad_hosts = [
+        h for h in extra_hosts
+        if not isinstance(h, str) or not h.strip() or any(c.isspace() for c in h)
+    ]
+    if bad_hosts:
+        console.print(
+            "  [red]✗ proxy.extra_allowed_hosts contains invalid entries "
+            f"({bad_hosts!r}) — use hostnames or globs like "
+            "'*.example.com'.[/red]"
+        )
+        return 1
     allowed = list(ip._DEFAULT_ALLOWED_HOSTS) + [
         h for h in extra_hosts if h not in ip._DEFAULT_ALLOWED_HOSTS
     ]
@@ -416,6 +467,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         audit_log=audit_log_path,
         allowed_hosts=allowed,
         upstream_deny_cidrs=deny_cidrs,
+        # Public-browsing policy: when enabled the generated allowlist gets
+        # the literal ``*`` domain so general research/package traffic
+        # works; SSRF deny CIDRs and host-scoped secrets stay unchanged.
+        allow_public_hosts=bool(proxy_cfg.get("allow_public_hosts", False)),
     )
     cfg_path = ip.write_proxy_config(iron_cfg)
     mappings_path = ip.write_mappings(mappings)
@@ -882,7 +937,13 @@ def _load_env_file_into_environ() -> int:
     except Exception:  # noqa: BLE001 — best-effort convenience, never fatal
         return 0
     added = 0
-    known = set(ip._BEARER_PROVIDERS) | set(ip._NON_BEARER_PROVIDERS)
+    known = (
+        set(ip._BEARER_PROVIDERS)
+        | set(ip._NON_BEARER_PROVIDERS)
+        | set(ip._HEADER_AUTH_PROVIDERS)
+    )
+    for spec in ip._HEADER_AUTH_PROVIDERS.values():
+        known.update(spec.get("aliases") or ())
     for name in known:
         if name in os.environ and os.environ[name].strip():
             continue

@@ -75,7 +75,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -144,34 +144,41 @@ _DEFAULT_ALLOWED_HOSTS: Tuple[str, ...] = (
 )
 
 # Provider env-var name -> upstream host (or list of hosts) on which the
-# Authorization Bearer token should be swapped.
+# Authorization Bearer token should be swapped.  Providers that need
+# aliases, per-host method scopes, query matching or non-Authorization
+# headers live in ``_HEADER_AUTH_PROVIDERS`` below.
 _BEARER_PROVIDERS: Dict[str, Tuple[str, ...]] = {
-    "OPENROUTER_API_KEY": ("openrouter.ai", "*.openrouter.ai"),
     "OPENAI_API_KEY": ("api.openai.com",),
     "GROQ_API_KEY": ("api.groq.com",),
     "TOGETHER_API_KEY": ("api.together.xyz",),
     "DEEPSEEK_API_KEY": ("api.deepseek.com",),
     "MISTRAL_API_KEY": ("api.mistral.ai",),
-    "XAI_API_KEY": ("api.x.ai",),
     "NOUS_API_KEY": ("inference.nousresearch.com",),
 }
 
 
-# Providers whose API authenticates with a NON-Authorization header.
-# iron-proxy v0.39's ``secrets.replace.match_headers`` targets arbitrary
-# header names (case-insensitive; confirmed by the iron-proxy author on
-# PR #30179 and verified in the pinned v0.39.0 source — ``swapHeaders``
-# + ``parseHeaderMatchers``), so these are first-class swapped providers,
+# Providers whose API authenticates with a specific header set (native
+# x-api-key / api-key / custom headers, or Authorization with extra scope
+# like aliases, query matching or per-host methods).  iron-proxy v0.39's
+# ``secrets.replace.match_headers`` targets arbitrary header names
+# (case-insensitive; confirmed by the iron-proxy author on PR #30179 and
+# verified in the pinned v0.39.0 source — ``swapHeaders`` +
+# ``parseHeaderMatchers``), so these are first-class swapped providers,
 # not "uncovered".
 #
-# ``aliases`` are interchangeable env-var names for the SAME upstream
-# credential (Hermes' auth.py keys Google on both GEMINI_API_KEY and
-# GOOGLE_API_KEY).  Aliased names MUST collapse into a single mapping:
-# every rule carries ``require: true``, and two require-rules on the same
-# host reject each other's requests (each rule whose own token isn't
-# present returns ActionReject).  The sandbox receives the minted token
-# under the canonical name AND every alias so SDKs reading either work.
-_HEADER_AUTH_PROVIDERS: Dict[str, Dict[str, Tuple[str, ...]]] = {
+# Spec keys: ``hosts`` (required), ``match_headers`` (required; an EMPTY
+# tuple means "scan every request header" — iron-proxy semantics),
+# ``aliases`` (interchangeable env-var names for the SAME upstream
+# credential), ``methods`` (optional per-host method scope; empty = the
+# module default ``_DEFAULT_RULE_METHODS``), ``match_query`` (optional,
+# default true: accept the proxy token in a query parameter too).
+#
+# Aliased names MUST collapse into a single mapping: every rule carries
+# ``require: true``, and two require-rules on the same host reject each
+# other's requests (each rule whose own token isn't present returns
+# ActionReject).  The sandbox receives the minted token under the
+# canonical name AND every alias so SDKs reading either work.
+_HEADER_AUTH_PROVIDERS: Dict[str, Dict[str, Any]] = {
     # Anthropic native: x-api-key.  Authorization is also matched so an
     # SDK sending the token as a Bearer (OAuth-style) still swaps.
     "ANTHROPIC_API_KEY": {
@@ -197,7 +204,99 @@ _HEADER_AUTH_PROVIDERS: Dict[str, Dict[str, Tuple[str, ...]]] = {
         "match_headers": ("x-goog-api-key",),
         "aliases": ("GOOGLE_API_KEY",),
     },
+    # xAI / Grok: ONE credential family.  Hermes' auth layer keys xAI on
+    # XAI_API_KEY; the shared K3 skills reference GROK_API_KEY /
+    # XAI_GROK_API_KEY — all three are the same upstream credential, so
+    # they collapse into a single mapping.
+    "XAI_API_KEY": {
+        "hosts": ("api.x.ai",),
+        "match_headers": ("Authorization",),
+        "aliases": ("GROK_API_KEY", "XAI_GROK_API_KEY"),
+        "methods": ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        "match_query": False,
+    },
+    # OpenRouter: chat completions are POST + Authorization.  The public
+    # model catalog GET (``/api/v1/models`` — fetched for context-length
+    # metadata, no credentials) must pass untouched; requiring the token
+    # on that GET returned 403.  POST-only scope also keeps the CONNECT
+    # tunnel itself out of the rule (see ``build_proxy_config``).
+    "OPENROUTER_API_KEY": {
+        "hosts": ("openrouter.ai", "*.openrouter.ai"),
+        "match_headers": ("Authorization",),
+        "aliases": (),
+        "methods": ("POST",),
+        "match_query": False,
+    },
+    # Arkham Intelligence: ``API-Key`` header on the current API hostname.
+    "ARKHAM_API_KEY": {
+        "hosts": ("api.arkm.com",),
+        "match_headers": ("API-Key",),
+        "aliases": (),
+        "methods": ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        "match_query": False,
+    },
+    # Etherscan-compatible explorers: the key travels as an ``apikey``
+    # QUERY parameter, so query matching is on and no header is scoped
+    # (empty ``match_headers`` = scan every header, iron-proxy
+    # semantics).  One key covers the four explorer hosts.
+    "ETHERSCAN_API_KEY": {
+        "hosts": (
+            "api.etherscan.io",
+            "api.basescan.org",
+            "api.arbiscan.io",
+            "api-optimistic.etherscan.io",
+        ),
+        "match_headers": (),
+        "aliases": (),
+        "methods": ("GET", "HEAD", "POST"),
+        "match_query": True,
+    },
+    # CoinGecko: DEMO tier only.  Canonical ``COINGECKO_DEMO_API_KEY``
+    # with the legacy generic name as its sole alias; the Pro host/header
+    # are deliberately not part of this provider, and
+    # ``COINGECKO_PRO_API_KEY`` is unknown to discovery so a Pro
+    # credential can never mint a mapping or collapse into the Demo
+    # family (distinct tiers are not interchangeable).
+    "COINGECKO_DEMO_API_KEY": {
+        "hosts": ("api.coingecko.com",),
+        "match_headers": ("x-cg-demo-api-key",),
+        "aliases": ("COINGECKO_API_KEY",),
+        "methods": ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        "match_query": False,
+    },
+    # Firecrawl: Authorization bearer.
+    "FIRECRAWL_API_KEY": {
+        "hosts": ("api.firecrawl.dev",),
+        "match_headers": ("Authorization",),
+        "aliases": (),
+        "methods": ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        "match_query": False,
+    },
+    # Tenderly: ``X-Access-Key`` header; ONE credential family whose
+    # skill-referenced alias names (TENDERLY_ACCESS_KEY / TENDERLY_API_KEY)
+    # collapse into the canonical TENDERLY_ACCESS_TOKEN.
+    "TENDERLY_ACCESS_TOKEN": {
+        "hosts": ("api.tenderly.co",),
+        "match_headers": ("X-Access-Key",),
+        "aliases": ("TENDERLY_ACCESS_KEY", "TENDERLY_API_KEY"),
+        "methods": ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"),
+        "match_query": False,
+    },
 }
+
+
+# Method scope applied to a generated secrets rule when the mapping does
+# not carry an explicit list.  CONNECT is deliberately excluded: the proxy
+# runs the transform pipeline on the SYNTHETIC CONNECT request that opens
+# every HTTPS tunnel (``tunnelTransformCheck`` in the pinned v0.39.0
+# source), where no proxy token can be present yet — a method-less
+# ``require: true`` rule would reject the tunnel itself before the client
+# could ever send the swapped header.  Scoping every rule to real request
+# methods keeps the tunnel open and the credential swap on the decrypted
+# request.
+_DEFAULT_RULE_METHODS: Tuple[str, ...] = (
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE",
+)
 
 
 # Providers whose env-var names we recognize but whose auth genuinely cannot
@@ -342,6 +441,15 @@ class TokenMapping:
     ``GEMINI_API_KEY``).  They do not appear in the iron-proxy config —
     only one secrets rule is emitted per mapping, keyed on
     ``real_env_name``.
+
+    ``methods`` is the per-host method scope of the generated secrets
+    rule (empty = the module default ``_DEFAULT_RULE_METHODS``; CONNECT is
+    never scoped so the tunnel that opens each HTTPS connection is not
+    rejected before the token could be sent).
+
+    ``match_query`` additionally accepts the proxy token in a request
+    query parameter (query-auth providers such as Etherscan).  Defaults
+    to true, matching the historical behavior.
     """
 
     proxy_token: str
@@ -349,6 +457,8 @@ class TokenMapping:
     upstream_hosts: Tuple[str, ...]
     match_headers: Tuple[str, ...] = ("Authorization",)
     alias_env_names: Tuple[str, ...] = ()
+    methods: Tuple[str, ...] = ()
+    match_query: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -1110,6 +1220,7 @@ def build_proxy_config(
     allowed_hosts: Optional[List[str]] = None,
     upstream_deny_cidrs: Optional[List[str]] = None,
     http_listen: Optional[List[str]] = None,
+    allow_public_hosts: bool = False,
 ) -> Dict:
     """Build the iron-proxy YAML config (as a dict) for a given mapping set.
 
@@ -1131,6 +1242,20 @@ def build_proxy_config(
     169.254.169.254), and RFC1918.  Pass an explicit ``[]`` to opt out of
     the deny list entirely (only sensible in hermetic tests).
 
+    Public-host policy: ``allow_public_hosts=True`` adds the literal
+    ``*`` domain to the allowlist so general research/package traffic
+    reaches arbitrary public hosts.  The SSRF deny CIDRs and the
+    host-scoped secrets rules are unchanged — credentials are never
+    substituted outside their inventoried hosts.
+
+    Method scope: every generated secrets rule carries a per-host
+    ``methods`` list (the mapping's own scope, else
+    ``_DEFAULT_RULE_METHODS``).  CONNECT is never included: the proxy runs
+    the transform pipeline on the synthetic CONNECT request that opens
+    each HTTPS tunnel, and a ``require: true`` rule matching CONNECT
+    would reject the tunnel before the client could send the swapped
+    header.
+
     Schema mirrors the official iron-proxy schema as of v0.39.0.  Notable
     points:
 
@@ -1147,6 +1272,8 @@ def build_proxy_config(
     """
 
     hosts: List[str] = list(allowed_hosts or _DEFAULT_ALLOWED_HOSTS)
+    if allow_public_hosts and "*" not in hosts:
+        hosts.append("*")
     for m in mappings:
         for h in m.upstream_hosts:
             if h not in hosts:
@@ -1154,24 +1281,33 @@ def build_proxy_config(
 
     secrets_rules = []
     for m in mappings:
-        match_headers = list(m.match_headers or ("Authorization",))
+        # Per-mapping credential location(s).  Emit exactly what the
+        # mapping declares — an explicitly EMPTY match_headers list is
+        # meaningful (iron-proxy scans every request header then; used by
+        # query-auth providers like Etherscan) and must not silently
+        # fall back to Authorization.
+        match_headers = list(m.match_headers)
+        # Per-host method scope; CONNECT is never included (see above).
+        rule_methods = list(m.methods) if m.methods else list(_DEFAULT_RULE_METHODS)
         secrets_rules.append({
             "source": {"type": "env", "var": m.real_env_name},
             "replace": {
                 "proxy_value": m.proxy_token,
                 # Per-provider header set: bearer providers match only
                 # Authorization; header-auth providers (Anthropic native
-                # x-api-key, Azure api-key, Gemini x-goog-api-key) match
-                # their native header (+ Authorization where the provider
-                # also accepts bearer flows).  v0.39 matches header names
-                # case-insensitively — see parseHeaderMatchers upstream.
+                # x-api-key, Azure api-key, Gemini x-goog-api-key, ...)
+                # match their native header (+ Authorization where the
+                # provider also accepts bearer flows).  v0.39 matches
+                # header names case-insensitively — see
+                # parseHeaderMatchers upstream.
                 "match_headers": match_headers,
-                # The token is also accepted as a query param — v0.39 scans
-                # every query parameter for the token value, which covers
-                # SDKs that pass ``?key=<token>`` (Gemini) as well as
-                # bearer-in-query styles.  Body matching is off — we
-                # don't want body inspection forced for every request.
-                "match_query": True,
+                # The token is also accepted as a query param when the
+                # mapping says so (v0.39 scans every query parameter for
+                # the token value — covers SDKs that pass ``?key=<token>``
+                # (Gemini) and query-auth APIs like Etherscan's
+                # ``apikey=``).  Body matching is off — we don't want body
+                # inspection forced for every request.
+                "match_query": bool(m.match_query),
                 "match_body": False,
                 # Fail closed (maxpetrusenko P1): when a request reaches an
                 # allowlisted upstream WITHOUT the proxy token present in a
@@ -1184,7 +1320,10 @@ def build_proxy_config(
                 # TransformRequest — verified present in the pinned version).
                 "require": True,
             },
-            "rules": [{"host": h} for h in m.upstream_hosts],
+            "rules": [
+                {"host": h, "methods": list(rule_methods)}
+                for h in m.upstream_hosts
+            ],
         })
 
     # SSRF protection: default-deny cloud metadata + loopback + RFC1918.
@@ -1404,6 +1543,8 @@ def write_mappings(mappings: List[TokenMapping]) -> Path:
                 "upstream_hosts": list(m.upstream_hosts),
                 "match_headers": list(m.match_headers),
                 "alias_env_names": list(m.alias_env_names),
+                "methods": list(m.methods),
+                "match_query": bool(m.match_query),
             }
             for m in mappings
         ],
@@ -1434,19 +1575,39 @@ def load_mappings() -> List[TokenMapping]:
     out: List[TokenMapping] = []
     for item in payload.get("tokens", []):
         try:
+            # An explicitly-empty ``match_headers`` list is preserved: it
+            # means "scan every request header" for query-auth providers
+            # (Etherscan).  Only a MISSING key falls back to the bearer
+            # default — mappings.json files written before the
+            # match_headers/alias fields existed load with the same
+            # behavior they were written under.
+            raw_headers = item.get("match_headers")
             out.append(TokenMapping(
                 proxy_token=item["proxy_token"],
                 real_env_name=item["env_name"],
                 upstream_hosts=tuple(item.get("upstream_hosts") or ()),
-                # Pre-header-auth mappings.json files (written before the
-                # match_headers/alias fields existed) load with the bearer
-                # defaults — identical to their behavior at write time.
-                match_headers=tuple(item.get("match_headers") or ("Authorization",)),
+                match_headers=(
+                    tuple(raw_headers) if raw_headers is not None
+                    else ("Authorization",)
+                ),
                 alias_env_names=tuple(item.get("alias_env_names") or ()),
+                methods=tuple(item.get("methods") or ()),
+                match_query=bool(item.get("match_query", True)),
             ))
         except (KeyError, TypeError):
             continue
     return out
+
+
+def _default_token_prefix(env_name: str) -> str:
+    """Cosmetic prefix for a minted proxy token (``OPENROUTER_API_KEY`` ->
+    ``openrouter``).  Unrelated to the token's entropy."""
+
+    lowered = env_name.lower()
+    for suffix in ("_api_key", "_access_token", "_access_key", "_token"):
+        if lowered.endswith(suffix):
+            return lowered[: -len(suffix)]
+    return lowered
 
 
 def discover_provider_mappings(
@@ -1471,7 +1632,7 @@ def discover_provider_mappings(
         if env_name not in names:
             continue
         mappings.append(TokenMapping(
-            proxy_token=mint_proxy_token(prefix=env_name.lower().replace("_api_key", "")),
+            proxy_token=mint_proxy_token(prefix=_default_token_prefix(env_name)),
             real_env_name=env_name,
             upstream_hosts=hosts,
         ))
@@ -1487,11 +1648,13 @@ def discover_provider_mappings(
         if env_name not in names and not any(a in names for a in aliases):
             continue
         mappings.append(TokenMapping(
-            proxy_token=mint_proxy_token(prefix=env_name.lower().replace("_api_key", "")),
+            proxy_token=mint_proxy_token(prefix=_default_token_prefix(env_name)),
             real_env_name=env_name,
             upstream_hosts=tuple(spec["hosts"]),
             match_headers=tuple(spec["match_headers"]),
             alias_env_names=aliases,
+            methods=tuple(spec.get("methods") or ()),
+            match_query=bool(spec.get("match_query", True)),
         ))
     return mappings
 
@@ -1531,7 +1694,10 @@ def merge_mappings(
     By default this PRESERVES tokens for providers already in ``existing`` —
     re-running ``hermes egress setup`` should not invalidate the tokens
     baked into containers that are already running.  Only newly added
-    providers get freshly minted tokens.
+    providers get freshly minted tokens.  The credential SCOPE
+    (hosts/headers/aliases/methods/query) is refreshed from discovery so a
+    corrected registry definition takes effect on re-setup without
+    rotating tokens.
 
     When ``rotate=True``, every token in the result is freshly minted
     regardless of overlap.  The wizard exposes this via ``--rotate-tokens``
@@ -1547,19 +1713,59 @@ def merge_mappings(
     for d in discovered:
         prior = by_name.get(d.real_env_name)
         if prior is not None and not rotate:
-            # Preserve the token; refresh hosts/headers/aliases in case
-            # the provider spec changed since last setup (new upstreams,
-            # a provider moving from uncovered to header-auth, etc).
+            # Preserve the token; refresh hosts/headers/aliases/methods/
+            # query scope in case the provider spec changed since last
+            # setup (new upstreams, a provider moving from uncovered to
+            # header-auth, a corrected search location, etc).
             out.append(TokenMapping(
                 proxy_token=prior.proxy_token,
                 real_env_name=prior.real_env_name,
                 upstream_hosts=d.upstream_hosts,
                 match_headers=d.match_headers,
                 alias_env_names=d.alias_env_names,
+                methods=d.methods,
+                match_query=d.match_query,
             ))
         else:
             out.append(d)
     return out
+
+
+def find_registry_conflicts(
+    registry: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
+    """Return env-name conflicts in a provider registry (fail closed).
+
+    Every env name — canonical or alias — must be owned by exactly ONE
+    registry entry.  Two entries claiming the same name would mint two
+    mappings (one per canonical) whose ``require: true`` rules then reject
+    each other on the shared host, and an alias pointing at a different
+    provider could silently swap the wrong secret.  ``None`` checks the
+    production registry (bearer + header-auth entries merged); a custom
+    dict with the ``_HEADER_AUTH_PROVIDERS`` shape is used by tests.
+    """
+
+    if registry is None:
+        registry = {
+            env_name: {
+                "hosts": hosts,
+                "match_headers": ("Authorization",),
+                "aliases": (),
+            }
+            for env_name, hosts in _BEARER_PROVIDERS.items()
+        }
+        registry.update(_HEADER_AUTH_PROVIDERS)
+
+    owners: Dict[str, str] = {}
+    conflicts: List[str] = []
+    for env_name, spec in registry.items():
+        for name in (env_name, *(spec.get("aliases") or ())):
+            prior = owners.get(name)
+            if prior is None:
+                owners[name] = env_name
+            elif prior != env_name:
+                conflicts.append(f"{name}: claimed by both {prior} and {env_name}")
+    return conflicts
 
 
 # ---------------------------------------------------------------------------

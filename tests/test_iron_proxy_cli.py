@@ -338,3 +338,62 @@ def test_cmd_setup_audit_log_failure_is_warning_not_abort(hermes_home, monkeypat
 
     rc = proxy_cli.cmd_setup(_args())
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage-2 scope surfaces: public-host policy, required mappings, env backfill
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_setup_generates_public_allowlist_when_configured(hermes_home, monkeypatch):
+    """proxy.allow_public_hosts: true reaches the generated allowlist (a
+    literal ``*`` domain) while mapping hosts stay present."""
+
+    import yaml
+
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["allow_public_hosts"] = True
+    save_config(cfg)
+
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
+    monkeypatch.setattr(ip, "discover_provider_mappings", lambda **kw: [
+        ip.TokenMapping(
+            proxy_token="hermes-proxy-deadbeef",
+            real_env_name="OPENROUTER_API_KEY",
+            upstream_hosts=("openrouter.ai",),
+        ),
+    ])
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+
+    rc = proxy_cli.cmd_setup(_args())
+    assert rc == 0
+    written = yaml.safe_load(
+        (hermes_home / "proxy" / "proxy.yaml").read_text()
+    )
+    domains = written["transforms"][0]["config"]["domains"]
+    assert "*" in domains
+    assert "openrouter.ai" in domains
+
+
+def test_load_env_file_backfills_header_auth_names_and_aliases(hermes_home, monkeypatch):
+    """Keys kept only in ~/.hermes/.env must be discoverable for header-auth
+    providers and aliases too (GROK_API_KEY, TENDERLY_ACCESS_KEY, ...)."""
+
+    for name in ("GROK_API_KEY", "TENDERLY_ACCESS_KEY", "COINGECKO_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    with patch("hermes_cli.config.load_env", return_value={
+        "GROK_API_KEY": "xai-from-dotenv",
+        "TENDERLY_ACCESS_KEY": "tenderly-from-dotenv",
+        "COINGECKO_API_KEY": "coingecko-from-dotenv",
+        "UNRELATED_NOT_A_PROVIDER": "do-not-import",
+    }):
+        added = proxy_cli._load_env_file_into_environ()
+
+    assert os.environ.get("GROK_API_KEY") == "xai-from-dotenv"
+    assert os.environ.get("TENDERLY_ACCESS_KEY") == "tenderly-from-dotenv"
+    assert os.environ.get("COINGECKO_API_KEY") == "coingecko-from-dotenv"
+    assert "UNRELATED_NOT_A_PROVIDER" not in os.environ
+    assert added >= 3
